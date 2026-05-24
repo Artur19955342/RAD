@@ -1,0 +1,116 @@
+:root {
+  --font:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    sans-serif;
+  --surface: #edf1f3;
+  --workspace: #fbfcfd;
+  --panel: #f6f8f8;
+  --header: #ffffff;
+  --text: #26323a;
+  --text-strong: #101820;
+  --muted: #596873;
+  --placeholder: #68747c;
+  --line: #d9e0e4;
+  --rule: #9aa9b3;
+  --input: #ffffff;
+  --input-line: #cad4d9;
+  --button: #0f6f78;
+  --button-hover: #0a5f67;
+  --button-line: #0f6f78;
+  --button-text: #ffffff;
+  --focus: #227d8a;
+  --focus-soft: rgba(34, 125, 138, 0.16);
+  --row-hover: #e8eef0;
+  --danger: #b42318;
+  --danger-soft: #fbe8e6;
+  --selection: #cdebf0;
+  --finding-active: #cfe8ff;
+  --variant: #075f68;
+  --variant-line: #19a0ac;
+  --variant-bg: #e2f5f7;
+  --pill-pending: #ffe58f;
+  --pill-pending-line: #d6a800;
+  --pill-complete: #b8f0c8;
+  --pill-complete-line: #48a868;
+  --floating: #ffffff;
+  --chip: #f5f8f9;
+  --chip-line: #d5dde1;
+  --shadow:
+    rgba(16, 24, 32, 0.12) 0 16px 38px, rgba(16, 24, 32, 0.08) 0 4px 12px;
+
+  color: var(--text);
+  background: var(--surface);
+  font-family: var(--font);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  background: var(--surface);
+}
+
+body {
+  min-width: 320px;
+  min-height: 100svh;
+  margin: 0;
+}
+
+#root {
+  min-height: 100svh;
+}
+
+.app-error-boundary {
+  min-height: 100svh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.app-error-boundary section {
+  width: min(460px, 100%);
+  display: grid;
+  gap: 14px;
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--floating);
+  box-shadow: var(--shadow);
+}
+
+.app-error-boundary h1,
+.app-error-boundary p {
+  margin: 0;
+}
+
+.app-error-boundary h1 {
+  color: var(--text-strong);
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.app-error-boundary p {
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.app-error-boundary button {
+  justify-self: start;
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid var(--button-line);
+  border-radius: 7px;
+  background: var(--button);
+  color: var(--button-text);
+  font: 700 14px/1.2 var(--font);
+  cursor: pointer;
+}
