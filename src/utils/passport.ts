@@ -1,4 +1,8 @@
-import type { PassportData, PatientSex } from '../types'
+import type {
+  PassportCustomFieldDefinition,
+  PassportData,
+  PatientSex,
+} from '../types'
 
 const padDatePart = (value: number) => String(value).padStart(2, '0')
 
@@ -12,6 +16,63 @@ const getDigitsOnly = (value: string, maxLength: number) =>
 
 export const createPassportFieldId = () =>
   `passport-field-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+export const normalizePassportCustomFieldDefinition = (
+  field: PassportCustomFieldDefinition,
+): PassportCustomFieldDefinition | null => {
+  const id = field.id.trim()
+  const label = field.label.trim()
+
+  return id && label ? { id, label } : null
+}
+
+export const mergePassportCustomFieldDefinitions = (
+  ...definitionLists: PassportCustomFieldDefinition[][]
+) => {
+  const definitions: PassportCustomFieldDefinition[] = []
+  const usedIds = new Set<string>()
+
+  definitionLists.forEach((definitionList) => {
+    definitionList.forEach((field) => {
+      const definition = normalizePassportCustomFieldDefinition(field)
+
+      if (!definition || usedIds.has(definition.id)) {
+        return
+      }
+
+      usedIds.add(definition.id)
+      definitions.push(definition)
+    })
+  })
+
+  return definitions
+}
+
+export const applyPassportCustomFieldDefinitions = (
+  passportData: PassportData,
+  definitions: PassportCustomFieldDefinition[],
+): PassportData => {
+  const valuesById = new Map(
+    passportData.customFields.map((field) => [field.id, field.value]),
+  )
+
+  return {
+    ...passportData,
+    customFields: mergePassportCustomFieldDefinitions(definitions).map(
+      (field) => ({
+        ...field,
+        value: valuesById.get(field.id) ?? '',
+      }),
+    ),
+  }
+}
+
+export const getPassportCustomFieldDefinitions = (
+  passportData: PassportData,
+) =>
+  mergePassportCustomFieldDefinitions(
+    passportData.customFields.map(({ id, label }) => ({ id, label })),
+  )
 
 export const formatDateInputValue = (value: string) => {
   const digits = getDigitsOnly(value, 8)
@@ -31,13 +92,17 @@ export const formatTimeInputValue = (value: string) => {
   return parts.join(':')
 }
 
-export const createDefaultPassportData = (): PassportData => ({
+export const createDefaultPassportData = (
+  customFieldDefinitions: PassportCustomFieldDefinition[] = [],
+): PassportData => ({
   fullName: '',
   sex: '',
   birthDate: '',
   studyDate: formatDateValue(new Date()),
   studyTime: '',
-  customFields: [],
+  customFields: mergePassportCustomFieldDefinitions(
+    customFieldDefinitions,
+  ).map((field) => ({ ...field, value: '' })),
 })
 
 export const formatPatientShortName = (fullName: string) => {

@@ -7,6 +7,7 @@ export type UserDataSnapshot = {
   findingFolders: unknown[]
   hasOpenedProtocol: boolean
   openProtocolSessions: unknown[]
+  passportCustomFields: unknown[]
   protocolExportSettings: unknown
   savedFindings: unknown[]
   templates: unknown[]
@@ -51,6 +52,9 @@ const normalizeSnapshot = (value: unknown): UserDataSnapshot | null => {
     findingFolders: value.findingFolders,
     hasOpenedProtocol: Boolean(value.hasOpenedProtocol),
     openProtocolSessions: value.openProtocolSessions,
+    passportCustomFields: Array.isArray(value.passportCustomFields)
+      ? value.passportCustomFields
+      : [],
     protocolExportSettings: value.protocolExportSettings,
     savedFindings: value.savedFindings,
     templates: value.templates,

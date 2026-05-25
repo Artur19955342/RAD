@@ -25,11 +25,14 @@ function ProtocolTemplatesDialog({
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(
     null,
   )
+  const [deleteTemplateId, setDeleteTemplateId] = useState<string | null>(null)
   const [draftName, setDraftName] = useState(
     initialMode === 'save' ? currentTemplateName : '',
   )
   const selectedTemplate =
     templates.find((template) => template.id === selectedTemplateId) ?? null
+  const deleteTemplate =
+    templates.find((template) => template.id === deleteTemplateId) ?? null
   const isSaveMode = initialMode === 'save'
 
   const chooseSelectedTemplate = () => {
@@ -57,6 +60,27 @@ function ProtocolTemplatesDialog({
 
     onSaveTemplate(draftName)
     onClose()
+  }
+
+  const requestDeleteTemplate = (id: string) => {
+    setDeleteTemplateId(id)
+  }
+
+  const cancelDeleteTemplate = () => {
+    setDeleteTemplateId(null)
+  }
+
+  const confirmDeleteTemplate = () => {
+    if (!deleteTemplate) {
+      return
+    }
+
+    if (selectedTemplateId === deleteTemplate.id) {
+      setSelectedTemplateId(null)
+    }
+
+    onDeleteTemplate(deleteTemplate.id)
+    setDeleteTemplateId(null)
   }
 
   return (
@@ -143,10 +167,7 @@ function ProtocolTemplatesDialog({
                     aria-label={`Удалить шаблон ${template.name}`}
                     className="template-dialog-delete-button"
                     onClick={() => {
-                      if (selectedTemplateId === template.id) {
-                        setSelectedTemplateId(null)
-                      }
-                      onDeleteTemplate(template.id)
+                      requestDeleteTemplate(template.id)
                     }}
                     type="button"
                   >
@@ -169,6 +190,44 @@ function ProtocolTemplatesDialog({
             >
               Выбрать
             </button>
+          </div>
+        )}
+
+        {deleteTemplate && (
+          <div
+            className="template-delete-confirm-backdrop"
+            onMouseDown={cancelDeleteTemplate}
+          >
+            <section
+              aria-labelledby="template-delete-confirm-title"
+              aria-modal="true"
+              className="template-delete-confirm"
+              onMouseDown={(event) => event.stopPropagation()}
+              role="alertdialog"
+            >
+              <div className="template-delete-confirm-icon" aria-hidden="true">
+                !
+              </div>
+              <div className="template-delete-confirm-body">
+                <h3 id="template-delete-confirm-title">Удалить шаблон?</h3>
+                <p>
+                  Шаблон «{deleteTemplate.name}» будет удален из списка
+                  шаблонов.
+                </p>
+              </div>
+              <div className="template-delete-confirm-actions">
+                <button onClick={cancelDeleteTemplate} type="button">
+                  Отмена
+                </button>
+                <button
+                  className="danger-action-button"
+                  onClick={confirmDeleteTemplate}
+                  type="button"
+                >
+                  Удалить
+                </button>
+              </div>
+            </section>
           </div>
         )}
       </section>

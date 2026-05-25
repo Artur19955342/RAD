@@ -140,6 +140,11 @@ export type PassportCustomField = {
   value: string
 }
 
+export type PassportCustomFieldDefinition = {
+  id: string
+  label: string
+}
+
 export type PassportData = {
   fullName: string
   sex: PatientSex
@@ -157,11 +162,38 @@ export type UserProfile = {
   updatedAt: number
 }
 
+export type ProtocolHeaderAlignment = 'left' | 'center' | 'right' | 'justify'
+
+export type ProtocolPageMargins = {
+  top: number
+  right: number
+  bottom: number
+  left: number
+}
+
+export type ProtocolSectionStyle = {
+  align: ProtocolHeaderAlignment
+  bold: boolean
+  fontSize: number
+  italic: boolean
+  underline: boolean
+}
+
 export type ProtocolExportSettings = {
+  conclusionStyle: ProtocolSectionStyle
+  descriptionStyle: ProtocolSectionStyle
+  documentFontFamily: string
   fileNameTemplate: string
   footerDoctorName: string
   footerSignatureText: string
+  headerAlign: ProtocolHeaderAlignment
+  headerBold: boolean
+  headerFontSize: number
+  headerItalic: boolean
   headerText: string
+  headerUnderline: boolean
+  pageMargins: ProtocolPageMargins
+  passportStyle: ProtocolSectionStyle
 }
 
 export type BrowserDragItem = {

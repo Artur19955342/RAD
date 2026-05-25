@@ -2,6 +2,7 @@ import {
   useEffect,
   useRef,
   useState,
+  type CSSProperties,
   type PointerEvent,
 } from 'react'
 
@@ -13,7 +14,9 @@ type VariantPopoverOption = {
 type VariantPopoverProps = {
   onAddOption: () => void
   onChangeOption: (index: number, value: string) => void
+  onDeleteOption: (index: number) => void
   onSelectOption: (index: number) => void
+  panelWidth: number
   variant: VariantPopoverOption
 }
 
@@ -28,14 +31,40 @@ type DragState = {
   pointerId: number
 }
 
-const getInitialPosition = (): VariantWindowPosition => {
+const getWindowWidth = (panelWidth: number) => {
+  if (typeof window === 'undefined') {
+    return panelWidth
+  }
+
+  return Math.min(Math.max(260, panelWidth), window.innerWidth - 12)
+}
+
+const getInitialPosition = (panelWidth: number): VariantWindowPosition => {
   if (typeof window === 'undefined') {
     return { x: 420, y: 88 }
   }
 
+  const width = getWindowWidth(panelWidth)
+
   return {
-    x: Math.max(12, window.innerWidth - 380),
+    x: Math.max(12, window.innerWidth - width),
     y: 88,
+  }
+}
+
+const getRightAlignedPosition = (
+  panelWidth: number,
+  y: number,
+): VariantWindowPosition => {
+  if (typeof window === 'undefined') {
+    return { x: 420, y }
+  }
+
+  const width = getWindowWidth(panelWidth)
+
+  return {
+    x: Math.max(12, window.innerWidth - width),
+    y,
   }
 }
 
@@ -51,7 +80,7 @@ const clampPosition = (
   const height = element?.offsetHeight ?? 320
 
   return {
-    x: Math.max(12, Math.min(position.x, window.innerWidth - width - 12)),
+    x: Math.max(12, Math.min(position.x, window.innerWidth - width)),
     y: Math.max(12, Math.min(position.y, window.innerHeight - height - 12)),
   }
 }
@@ -59,15 +88,24 @@ const clampPosition = (
 function VariantPopover({
   onAddOption,
   onChangeOption,
+  onDeleteOption,
   onSelectOption,
+  panelWidth,
   variant,
 }: VariantPopoverProps) {
   const windowRef = useRef<HTMLDivElement | null>(null)
   const optionRefs = useRef<Array<HTMLInputElement | null>>([])
   const previousOptionCount = useRef(variant.options.length)
   const dragState = useRef<DragState | null>(null)
-  const [position, setPosition] = useState(getInitialPosition)
+  const [position, setPosition] = useState(() =>
+    getInitialPosition(panelWidth),
+  )
   const [isDragging, setIsDragging] = useState(false)
+  const popoverStyle = {
+    '--variant-popover-width': `${getWindowWidth(panelWidth)}px`,
+    left: position.x,
+    top: position.y,
+  } as CSSProperties
 
   useEffect(() => {
     if (variant.options.length > previousOptionCount.current) {
@@ -79,9 +117,12 @@ function VariantPopover({
 
   useEffect(() => {
     setPosition((currentPosition) =>
-      clampPosition(currentPosition, windowRef.current),
+      clampPosition(
+        getRightAlignedPosition(panelWidth, currentPosition.y),
+        windowRef.current,
+      ),
     )
-  }, [variant.options.length])
+  }, [panelWidth, variant.options.length])
 
   const moveWindow = (clientX: number, clientY: number) => {
     const drag = dragState.current
@@ -153,7 +194,7 @@ function VariantPopover({
         .join(' ')}
       onMouseDown={(event) => event.stopPropagation()}
       ref={windowRef}
-      style={{ left: position.x, top: position.y }}
+      style={popoverStyle}
     >
       <div
         className="variant-popover-header"
@@ -177,15 +218,25 @@ function VariantPopover({
       <div className="variant-option-list">
         {variant.options.map((option, index) => (
           <div className="variant-option-row" key={index}>
-            <input
-              aria-label={`Вариант ${index + 1}`}
-              onChange={(event) => onChangeOption(index, event.target.value)}
-              ref={(element) => {
-                optionRefs.current[index] = element
-              }}
-              type="text"
-              value={option}
-            />
+            <div className="variant-option-input-wrap">
+              <input
+                aria-label={`Вариант ${index + 1}`}
+                onChange={(event) => onChangeOption(index, event.target.value)}
+                ref={(element) => {
+                  optionRefs.current[index] = element
+                }}
+                type="text"
+                value={option}
+              />
+              <button
+                aria-label={`Удалить вариант ${index + 1}`}
+                className="variant-delete-button"
+                onClick={() => onDeleteOption(index)}
+                type="button"
+              >
+                x
+              </button>
+            </div>
             <label className="variant-check" title="Выбрать вариант">
               <input
                 checked={option === variant.value}

@@ -34,9 +34,11 @@ import type {
   NumericSegment,
   PendingSelection,
   PassportData,
-  PassportCustomField,
+  PassportCustomFieldDefinition,
   PatientSex,
   ProtocolExportSettings,
+  ProtocolHeaderAlignment,
+  ProtocolSectionStyle,
   ProtocolTemplate,
   SavedFinding,
   SavedSelection,
@@ -74,16 +76,18 @@ import {
 import { escapeHtml } from './utils/html'
 import { getLateralityWarning } from './utils/lateralityCheck'
 import {
+  applyPassportCustomFieldDefinitions,
   createDefaultPassportData,
   createPassportFieldId,
   formatDateInputValue,
   formatPatientShortName,
   formatTimeInputValue,
+  getPassportCustomFieldDefinitions,
   getPassportCollapsedTitle,
+  mergePassportCustomFieldDefinitions,
 } from './utils/passport'
 import {
   buildProtocolFileNameTemplate,
-  createDocFileBlob,
   createDefaultProtocolExportSettings,
   createProtocolDownloadDocument,
   downloadDocFile,
@@ -92,6 +96,7 @@ import {
   getProtocolFileNameBlocks,
   loadProtocolExportSettings,
   parseProtocolFileNameDragItem,
+  protocolDocumentFontOptions,
   protocolFileNameDragDataType,
   sanitizeProtocolExportSettings,
   storeProtocolExportSettings,
@@ -115,6 +120,7 @@ import {
 let segmentSeed = 100
 let pairSeed = 0
 const markerText = '◆'
+const terminalMarkerLabel = 'К'
 const templatesStorageKey = 'radiology-app-protocol-templates-v1'
 const userTemplatesStorageKey = 'protocol-templates-v1'
 const userSavedFindingsStorageKey = 'saved-findings-v1'
@@ -130,6 +136,41 @@ const minDescriptionPanelHeight = 220
 const minConclusionPanelHeight = 160
 const resizeHandleSize = 6
 const sentenceTerminalPattern = /(?:\.{1,}|\u2026)\s*$/
+const protocolHeaderFontSizes = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36]
+const protocolHeaderAlignments: Array<{
+  label: string
+  title: string
+  value: ProtocolHeaderAlignment
+}> = [
+  { label: 'Л', title: 'По левому краю', value: 'left' },
+  { label: 'Ц', title: 'По центру', value: 'center' },
+  { label: 'П', title: 'По правому краю', value: 'right' },
+  { label: 'Ш', title: 'По ширине страницы', value: 'justify' },
+]
+const protocolPageMarginFields: Array<{
+  key: keyof ProtocolExportSettings['pageMargins']
+  label: string
+}> = [
+  { key: 'top', label: 'Верхнее' },
+  { key: 'right', label: 'Правое' },
+  { key: 'bottom', label: 'Нижнее' },
+  { key: 'left', label: 'Левое' },
+]
+type ProtocolSectionStyleKey =
+  | 'passportStyle'
+  | 'descriptionStyle'
+  | 'conclusionStyle'
+
+type ProtocolSectionTextFormatKey = 'bold' | 'italic' | 'underline'
+
+const protocolSectionStyleFields: Array<{
+  key: ProtocolSectionStyleKey
+  label: string
+}> = [
+  { key: 'passportStyle', label: 'Паспортная часть' },
+  { key: 'descriptionStyle', label: 'Описание' },
+  { key: 'conclusionStyle', label: 'Заключение' },
+]
 
 const clampValue = (value: number, min: number, max: number) =>
   Math.max(min, Math.min(value, max))
@@ -169,8 +210,132 @@ const createEmptyMarkerOption = (): MarkerOption => ({
   value: '',
 })
 
+const createManualMarkerOption = (): MarkerOption => ({
+  title: 'Новая заготовка',
+  value: '',
+})
+
+const standardMarkerOptionTitle = 'Стандартный'
+
+const markerBoundaryReminderText =
+  'Добавьте метку, чтобы указать границы раздела'
+
+const markerOptionHasContent = (option: MarkerOption) =>
+  Boolean(option.title.trim() || option.value.trim())
+
+const copyMarkerOption = (option: MarkerOption): MarkerOption => ({
+  title: option.title,
+  value: option.value,
+})
+
+const areMarkerOptionsEqual = (
+  firstOptions: MarkerOption[],
+  secondOptions: MarkerOption[],
+) =>
+  firstOptions.length === secondOptions.length &&
+  firstOptions.every(
+    (option, index) =>
+      option.title === secondOptions[index]?.title &&
+      option.value === secondOptions[index]?.value,
+  )
+
+const getMarkerOptionState = (
+  segment: MarkerSegment,
+  blockInfo: ReturnType<typeof getMarkerBlockInfo> | null,
+) => {
+  const meaningfulOptions = segment.options
+    .map((option, originalIndex) => ({ option, originalIndex }))
+    .filter(({ option }) => markerOptionHasContent(option))
+  const selectedMeaningfulIndex =
+    segment.selectedOptionIndex === null
+      ? null
+      : meaningfulOptions.findIndex(
+          ({ originalIndex }) => originalIndex === segment.selectedOptionIndex,
+        )
+  const normalizedSelectedIndex =
+    selectedMeaningfulIndex === -1 ? null : selectedMeaningfulIndex
+
+  if (!blockInfo?.hasNextMarker) {
+    return {
+      options: meaningfulOptions.map(({ option }) => copyMarkerOption(option)),
+      selectedOptionIndex: normalizedSelectedIndex,
+    }
+  }
+
+  const standardOption: MarkerOption = {
+    title: standardMarkerOptionTitle,
+    value: blockInfo.value,
+  }
+
+  if (!meaningfulOptions.length) {
+    return {
+      options: [standardOption],
+      selectedOptionIndex: null,
+    }
+  }
+
+  const options = meaningfulOptions.map(({ option }) => copyMarkerOption(option))
+  const standardIndex = options.findIndex(
+    (option) => option.title.trim() === standardMarkerOptionTitle,
+  )
+
+  if (standardIndex === -1) {
+    return {
+      options: [standardOption, ...options],
+      selectedOptionIndex:
+        normalizedSelectedIndex === null ? null : normalizedSelectedIndex + 1,
+    }
+  }
+
+  if (!options[standardIndex].value.trim()) {
+    options[standardIndex] = {
+      ...options[standardIndex],
+      value: blockInfo.value,
+    }
+  }
+
+  return {
+    options,
+    selectedOptionIndex: normalizedSelectedIndex,
+  }
+}
+
+const getResolvedMarkerOptionIndex = (
+  optionState: ReturnType<typeof getMarkerOptionState>,
+  blockInfo: ReturnType<typeof getMarkerBlockInfo> | null,
+) => {
+  if (
+    optionState.selectedOptionIndex !== null &&
+    optionState.selectedOptionIndex < optionState.options.length
+  ) {
+    return optionState.selectedOptionIndex
+  }
+
+  if (!blockInfo?.hasNextMarker) {
+    return null
+  }
+
+  const standardIndex = optionState.options.findIndex(
+    (option) => option.title.trim() === standardMarkerOptionTitle,
+  )
+
+  return standardIndex === -1 ? null : standardIndex
+}
+
+const canDeleteMarkerOption = (
+  option: MarkerOption,
+  blockInfo: ReturnType<typeof getMarkerBlockInfo> | null,
+) =>
+  !(
+    blockInfo?.hasNextMarker &&
+    option.title.trim() === standardMarkerOptionTitle
+  )
+
 const getMarkerOptionLabel = (option: MarkerOption, index: number) =>
   option.title.trim() || `Заготовка ${index + 1}`
+
+const getMarkerOptionTextareaKey = (markerId: number, index: number) =>
+  `${markerId}:${index}`
 
 const createTemplateId = () =>
   `template-${getTimestamp()}-${Math.random().toString(36).slice(2)}`
@@ -252,9 +417,7 @@ const segmentToProtocolText = (segment: EditorSegment) => {
     return segment.value
   }
 
-  const title = segment.title.trim()
-
-  return title ? `\n${title}\n` : ''
+  return '\n'
 }
 
 const getProtocolContentText = (content: EditorSegment[]) =>
@@ -412,10 +575,99 @@ const trimRangeWhitespace = (text: string, range: TextRange) => {
   return end > start ? { start, end } : null
 }
 
+const getPreviousNonWhitespaceIndex = (text: string, index: number) => {
+  for (let currentIndex = index - 1; currentIndex >= 0; currentIndex -= 1) {
+    if (!/\s/.test(text[currentIndex])) {
+      return currentIndex
+    }
+  }
+
+  return null
+}
+
+const getNextNonWhitespaceIndex = (text: string, index: number) => {
+  for (
+    let currentIndex = Math.max(0, index);
+    currentIndex < text.length;
+    currentIndex += 1
+  ) {
+    if (!/\s/.test(text[currentIndex])) {
+      return currentIndex
+    }
+  }
+
+  return null
+}
+
+const isSentenceTerminalChar = (char: string | undefined) =>
+  char === '.' || char === '\u2026'
+
+const isSentenceGapWhitespace = (
+  text: string,
+  start: number,
+  end: number,
+) => {
+  const previousIndex = getPreviousNonWhitespaceIndex(text, start)
+  const nextIndex = getNextNonWhitespaceIndex(text, end)
+
+  return (
+    previousIndex !== null &&
+    nextIndex !== null &&
+    isSentenceTerminalChar(text[previousIndex])
+  )
+}
+
+const getProtocolChangeHighlightRanges = (text: string, range: TextRange) => {
+  const trimmedRange = trimRangeWhitespace(text, range)
+
+  if (!trimmedRange) {
+    return []
+  }
+
+  const ranges: TextRange[] = []
+  let cursor = trimmedRange.start
+  let index = trimmedRange.start
+
+  while (index < trimmedRange.end) {
+    if (!/\s/.test(text[index])) {
+      index += 1
+      continue
+    }
+
+    const whitespaceStart = index
+
+    while (index < trimmedRange.end && /\s/.test(text[index])) {
+      index += 1
+    }
+
+    if (isSentenceGapWhitespace(text, whitespaceStart, index)) {
+      if (cursor < whitespaceStart) {
+        ranges.push({ start: cursor, end: whitespaceStart })
+      }
+
+      cursor = index
+    }
+  }
+
+  if (cursor < trimmedRange.end) {
+    ranges.push({ start: cursor, end: trimmedRange.end })
+  }
+
+  return ranges
+}
+
+const hasFindingContent = (value: string) =>
+  /[0-9A-Za-zА-Яа-яЁё]/.test(value)
+
 const isFindingText = (text: string, range: TextRange) => {
   const value = getRangeText(text, range).trim()
 
-  return Boolean(value) && value !== markerText && !value.endsWith(':')
+  return (
+    Boolean(value) &&
+    value !== markerText &&
+    !value.endsWith(':') &&
+    hasFindingContent(value)
+  )
 }
 
 const getFindingRangeAtOffset = (text: string, offset: number) => {
@@ -666,6 +918,208 @@ const findPairAtOffset = (
   pairs.find((pair) => isOffsetInRange(getPairRange(pair, field), offset)) ??
   null
 
+const getTextChangeDelta = (change: TextChange) =>
+  change.nextRange.end -
+  change.nextRange.start -
+  (change.previousRange.end - change.previousRange.start)
+
+const getTextChangeFromEdit = (
+  editStart: number,
+  delta: number,
+): TextChange => ({
+  nextRange:
+    delta > 0
+      ? { start: editStart, end: editStart + delta }
+      : { start: editStart, end: editStart },
+  previousRange:
+    delta < 0
+      ? { start: editStart, end: editStart - delta }
+      : { start: editStart, end: editStart },
+})
+
+const clampTextRange = (range: TextRange, text: string): TextRange => {
+  const start = Math.max(0, Math.min(range.start, text.length))
+  const end = Math.max(start, Math.min(range.end, text.length))
+
+  return { start, end }
+}
+
+const createCollapsedTextRange = (offset: number, text: string) => {
+  const safeOffset = Math.max(0, Math.min(offset, text.length))
+
+  return { start: safeOffset, end: safeOffset }
+}
+
+const getBestOverlappingFindingRange = (text: string, range: TextRange) =>
+  getFindingRanges(text)
+    .map((findingRange) => ({
+      overlap: getRangeOverlap(findingRange, range),
+      range: findingRange,
+    }))
+    .filter((item) => item.overlap > 0)
+    .sort((first, second) => second.overlap - first.overlap)[0]?.range ?? null
+
+const normalizePairRangeCandidate = (
+  field: FieldName,
+  range: TextRange,
+  text: string,
+) => {
+  const candidate = clampTextRange(range, text)
+
+  if (candidate.end <= candidate.start) {
+    return field === 'conclusion'
+      ? createCollapsedTextRange(candidate.start, text)
+      : null
+  }
+
+  const findingRange = getBestOverlappingFindingRange(text, candidate)
+
+  if (findingRange) {
+    return findingRange
+  }
+
+  return field === 'conclusion'
+    ? createCollapsedTextRange(candidate.start, text)
+    : null
+}
+
+const mapRangeThroughTextChange = (
+  range: TextRange,
+  change: TextChange,
+): TextRange => {
+  const delta = getTextChangeDelta(change)
+
+  if (range.end <= change.previousRange.start) {
+    return { ...range }
+  }
+
+  if (range.start >= change.previousRange.end) {
+    return {
+      start: Math.max(0, range.start + delta),
+      end: Math.max(0, range.end + delta),
+    }
+  }
+
+  const start =
+    range.start < change.previousRange.start
+      ? range.start
+      : change.nextRange.start
+  const end =
+    range.end > change.previousRange.end
+      ? range.end + delta
+      : change.nextRange.end
+
+  return {
+    start: Math.max(0, start),
+    end: Math.max(Math.max(0, start), end),
+  }
+}
+
+const doesTextChangeTouchRange = (range: TextRange, change: TextChange) => {
+  const isInsertion = change.previousRange.start === change.previousRange.end
+
+  if (isInsertion) {
+    return isOffsetInRange(range, change.previousRange.start)
+  }
+
+  return getRangeOverlap(range, change.previousRange) > 0
+}
+
+const adjustPairRangeForTextChange = (
+  range: TextRange,
+  field: FieldName,
+  change: TextChange,
+  nextText: string,
+  isEditedPair: boolean,
+) => {
+  const isInsertion = change.previousRange.start === change.previousRange.end
+  const insertedLength = change.nextRange.end - change.nextRange.start
+  const deletedPairRange =
+    !insertedLength &&
+    range.end > range.start &&
+    change.previousRange.start <= range.start &&
+    change.previousRange.end >= range.end
+
+  if (deletedPairRange) {
+    return field === 'conclusion'
+      ? createCollapsedTextRange(change.nextRange.start, nextText)
+      : null
+  }
+
+  if (isInsertion && isEditedPair) {
+    const start =
+      change.previousRange.start <= range.start
+        ? change.previousRange.start
+        : range.start
+    const nextRange = {
+      start,
+      end: Math.max(start, range.end + insertedLength),
+    }
+
+    return normalizePairRangeCandidate(field, nextRange, nextText)
+  }
+
+  const nextRange = mapRangeThroughTextChange(range, change)
+
+  return isEditedPair
+    ? normalizePairRangeCandidate(field, nextRange, nextText)
+    : clampTextRange(nextRange, nextText)
+}
+
+const dedupeFindingPairsByDescription = (pairs: FindingPair[]) => {
+  const result: FindingPair[] = []
+
+  pairs.forEach((pair) => {
+    const key = `${pair.description.start}:${pair.description.end}`
+    const existingIndex = result.findIndex(
+      (item) => `${item.description.start}:${item.description.end}` === key,
+    )
+
+    if (existingIndex === -1) {
+      result.push(pair)
+      return
+    }
+
+    const existing = result[existingIndex]
+    const existingConclusionLength =
+      existing.conclusion.end - existing.conclusion.start
+    const conclusionLength = pair.conclusion.end - pair.conclusion.start
+
+    if (conclusionLength > existingConclusionLength) {
+      result[existingIndex] = pair
+    }
+  })
+
+  return result
+}
+
+const adjustPairsForFieldTextChange = (
+  pairs: FindingPair[],
+  field: FieldName,
+  change: TextChange,
+  preferredPairId: number | null,
+  nextText: string,
+) =>
+  dedupeFindingPairsByDescription(
+    pairs.flatMap((pair) => {
+      const range = getPairRange(pair, field)
+      const isPreferredPair = preferredPairId === pair.id
+      const isEditedPair =
+        doesTextChangeTouchRange(range, change) ||
+        (isPreferredPair &&
+          isOffsetInRange(range, change.previousRange.start))
+      const nextRange = adjustPairRangeForTextChange(
+        range,
+        field,
+        change,
+        nextText,
+        isEditedPair,
+      )
+
+      return nextRange ? [setPairRange(pair, field, nextRange)] : []
+    }),
+  )
+
 const getTrimmedSelectionRange = (selection: SavedSelection) => {
   const leadingSpace = selection.text.match(/^\s*/)?.[0].length ?? 0
   const trailingSpace = selection.text.match(/\s*$/)?.[0].length ?? 0
@@ -685,15 +1139,6 @@ const getTrimmedSelectionRange = (selection: SavedSelection) => {
   }
 }
 
-const normalizeEditedRangeToSentence = (
-  text: string,
-  range: TextRange,
-  editStart: number,
-) =>
-  getSentenceRangeAtOffset(text, editStart) ??
-  getSentenceRangeAtOffset(text, range.start) ??
-  range
-
 const adjustPairsForFieldEdit = (
   pairs: FindingPair[],
   field: FieldName,
@@ -706,51 +1151,317 @@ const adjustPairsForFieldEdit = (
     return pairs
   }
 
-  const preferredPair =
-    preferredPairId !== null
-      ? pairs.find((pair) => pair.id === preferredPairId) ?? null
-      : null
-  const touchedPair =
-    preferredPair && isOffsetInRange(getPairRange(preferredPair, field), editStart)
-      ? preferredPair
-      : findPairAtOffset(pairs, field, editStart)
+  return adjustPairsForFieldTextChange(
+    pairs,
+    field,
+    getTextChangeFromEdit(editStart, delta),
+    preferredPairId,
+    nextText,
+  )
+}
 
-  return pairs.map((pair) => {
-    const range = getPairRange(pair, field)
+const createNumericTokenPattern = () => /( )(\d+(?:[.,]\d+)?)(?= )/g
 
-    if (touchedPair?.id === pair.id) {
-      const editedRange = {
-        start: range.start,
-        end: Math.max(range.start, range.end + delta),
+const parseMarkerTemplateContent = (value: string) => {
+  const segments: EditorSegment[] = []
+  let cursor = 0
+
+  while (cursor < value.length) {
+    const variantStart = value.indexOf('[[', cursor)
+
+    if (variantStart === -1) {
+      const text = value.slice(cursor)
+
+      if (text) {
+        segments.push(createTextSegment(text))
+      }
+      break
+    }
+
+    if (variantStart > cursor) {
+      segments.push(createTextSegment(value.slice(cursor, variantStart)))
+    }
+
+    const variantEnd = value.indexOf(']]', variantStart + 2)
+
+    if (variantEnd === -1) {
+      segments.push(createTextSegment(value.slice(variantStart)))
+      break
+    }
+
+    const options = value
+      .slice(variantStart + 2, variantEnd)
+      .split('|')
+      .map((option) => option.trim())
+      .filter(Boolean)
+
+    if (options.length) {
+      segments.push({
+        id: createSegmentId(),
+        options,
+        type: 'variant',
+        value: options[0],
+      })
+    } else {
+      segments.push(createTextSegment(value.slice(variantStart, variantEnd + 2)))
+    }
+
+    cursor = variantEnd + 2
+  }
+
+  return tokenizeNumericTextSegments(compactContent(segments))
+}
+
+const parseMarkerOptionVariantToken = (
+  value: string,
+  start: number,
+  end: number,
+) => {
+  const token = value.slice(start, end)
+
+  if (!token.startsWith('[[') || !token.endsWith(']]')) {
+    return null
+  }
+
+  const options = token
+    .slice(2, -2)
+    .split('|')
+    .map((option) => option.trim())
+
+  return options.some(Boolean)
+    ? {
+        options,
+        value: options.find(Boolean) ?? '',
+      }
+    : null
+}
+
+const createMarkerOptionVariantToken = (options: string[]) =>
+  `[[${options.map((option) => option.trim()).join('|')}]]`
+
+const getMarkerTemplateParts = (value: string) => {
+  const parts: Array<
+    | { rawEnd: number; rawStart: number; text: string; type: 'text' }
+    | {
+        options: string[]
+        rawEnd: number
+        rawStart: number
+        type: 'variant'
+        value: string
+      }
+  > = []
+  let cursor = 0
+
+  while (cursor < value.length) {
+    const variantStart = value.indexOf('[[', cursor)
+
+    if (variantStart === -1) {
+      const text = value.slice(cursor)
+
+      if (text) {
+        parts.push({
+          rawEnd: value.length,
+          rawStart: cursor,
+          text,
+          type: 'text',
+        })
+      }
+      break
+    }
+
+    if (variantStart > cursor) {
+      parts.push({
+        rawEnd: variantStart,
+        rawStart: cursor,
+        text: value.slice(cursor, variantStart),
+        type: 'text',
+      })
+    }
+
+    const variantEnd = value.indexOf(']]', variantStart + 2)
+
+    if (variantEnd === -1) {
+      parts.push({
+        rawEnd: value.length,
+        rawStart: variantStart,
+        text: value.slice(variantStart),
+        type: 'text',
+      })
+      break
+    }
+
+    const tokenEnd = variantEnd + 2
+    const options = value
+      .slice(variantStart + 2, variantEnd)
+      .split('|')
+      .map((option) => option.trim())
+
+    if (options.some(Boolean)) {
+      parts.push({
+        options,
+        rawEnd: tokenEnd,
+        rawStart: variantStart,
+        type: 'variant',
+        value: options.find(Boolean) ?? '',
+      })
+    } else {
+      parts.push({
+        rawEnd: tokenEnd,
+        rawStart: variantStart,
+        text: value.slice(variantStart, tokenEnd),
+        type: 'text',
+      })
+    }
+
+    cursor = tokenEnd
+  }
+
+  return parts
+}
+
+const markerOptionValueToHtml = (value: string) =>
+  getMarkerTemplateParts(value)
+    .map((part) => {
+      if (part.type === 'text') {
+        return escapeHtml(part.text)
       }
 
-      return setPairRange(
-        pair,
-        field,
-        normalizeEditedRangeToSentence(nextText, editedRange, editStart),
-      )
+      return `<span class="variant-token marker-option-variant-token" data-marker-option-variant="true" data-raw-start="${part.rawStart}" data-raw-end="${part.rawEnd}" data-options="${escapeHtml(
+        JSON.stringify(part.options),
+      )}" title="Варианты">${renderVariantValueHtml(part.value)}</span>`
+    })
+    .join('')
+
+const parseMarkerOptionEditorValue = (editor: HTMLElement) => {
+  let value = ''
+
+  const appendLineBreak = () => {
+    if (!value.endsWith('\n')) {
+      value += '\n'
+    }
+  }
+
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      value += node.textContent ?? ''
+      return
     }
 
-    if (range.start >= editStart) {
-      return setPairRange(pair, field, {
-        start: Math.max(0, range.start + delta),
-        end: Math.max(0, range.end + delta),
-      })
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return
     }
 
-    if (range.end > editStart) {
-      return setPairRange(pair, field, {
-        start: range.start,
-        end: Math.max(range.start, range.end + delta),
-      })
+    const element = node as HTMLElement
+
+    if (element.dataset.markerOptionVariant) {
+      let options: string[]
+
+      try {
+        const parsedOptions = JSON.parse(element.dataset.options ?? '[]')
+
+        options = Array.isArray(parsedOptions)
+          ? parsedOptions.map((option) =>
+              typeof option === 'string' ? option : '',
+            )
+          : []
+      } catch {
+        options = []
+      }
+
+      const text = element.textContent?.trim() ?? ''
+      const nextOptions = options.length
+        ? options.map((option, index) => (index === 0 ? text : option))
+        : [text]
+
+      value += createMarkerOptionVariantToken(nextOptions)
+      return
     }
 
-    return pair
-  })
+    if (element.tagName === 'BR') {
+      appendLineBreak()
+      return
+    }
+
+    const isBlockElement = element.tagName === 'DIV' || element.tagName === 'P'
+
+    if (isBlockElement && value) {
+      appendLineBreak()
+    }
+
+    const valueBeforeBlock = value
+
+    Array.from(element.childNodes).forEach(walk)
+
+    if (isBlockElement) {
+      if (value === valueBeforeBlock) {
+        value += '\n'
+      } else {
+        appendLineBreak()
+      }
+    }
+  }
+
+  Array.from(editor.childNodes).forEach(walk)
+
+  return value.endsWith('\n') ? value.slice(0, -1) : value
+}
+
+const getRawOffsetFromMarkerOptionDisplayOffset = (
+  value: string,
+  displayOffset: number,
+) => {
+  let rawCursor = 0
+  let displayCursor = 0
+
+  for (const part of getMarkerTemplateParts(value)) {
+    if (part.type === 'text') {
+      const length = part.text.length
+
+      if (displayOffset <= displayCursor + length) {
+        return part.rawStart + Math.max(0, displayOffset - displayCursor)
+      }
+
+      rawCursor = part.rawEnd
+      displayCursor += length
+      continue
+    }
+
+    const displayValue = part.value
+    const length = displayValue.length
+
+    if (displayOffset <= displayCursor + length) {
+      return part.rawStart + 2 + Math.max(0, displayOffset - displayCursor)
+    }
+
+    rawCursor = part.rawEnd
+    displayCursor += length
+  }
+
+  return rawCursor
+}
+
+const renderVariantValueHtml = (value: string) => {
+  const numericPattern = createNumericTokenPattern()
+  let cursor = 0
+  let html = ''
+  let match = numericPattern.exec(value)
+
+  while (match) {
+    const numberStart = match.index + match[1].length
+    const numberEnd = numberStart + match[2].length
+
+    html += escapeHtml(value.slice(cursor, numberStart))
+    html += `<span class="variant-number-token">${escapeHtml(match[2])}</span>`
+    cursor = numberEnd
+    match = numericPattern.exec(value)
+  }
+
+  html += escapeHtml(value.slice(cursor))
+  return html
 }
 
 const variantToHtml = (segment: VariantSegment) =>
-  `<span class="variant-token" data-variant-id="${segment.id}" title="Варианты">${escapeHtml(segment.value)}</span>`
+  `<span class="variant-token" data-variant-id="${segment.id}" title="Варианты">${renderVariantValueHtml(segment.value)}</span>`
 
 const numberToHtml = (segment: NumericSegment) =>
   `<span class="number-token" data-number-id="${segment.id}" title="Числовое значение">${escapeHtml(segment.value)}</span>`
@@ -759,8 +1470,9 @@ const markerToHtml = (
   segment: MarkerSegment,
   markerNumber: number,
   activeMarkerId: number | null,
+  isTerminalMarker = false,
 ) => {
-  const label = String(markerNumber)
+  const label = isTerminalMarker ? terminalMarkerLabel : String(markerNumber)
   const className = [
     'section-marker-token',
     activeMarkerId === segment.id ? 'is-active' : '',
@@ -769,7 +1481,11 @@ const markerToHtml = (
     .filter(Boolean)
     .join(' ')
   const title = segment.title.trim()
-  const titleText = title ? `Метка ${label}: ${title}` : `Метка ${label}`
+  const titleText = isTerminalMarker
+    ? 'Конец раздела'
+    : title
+      ? `Метка ${label}: ${title}`
+      : `Метка ${label}`
 
   return `<span class="${className}" contenteditable="false" data-marker-id="${segment.id}" data-marker-label="${escapeHtml(label)}" aria-label="${escapeHtml(titleText)}" title="${escapeHtml(titleText)}">${markerText}</span>`
 }
@@ -778,6 +1494,7 @@ const segmentToHtml = (
   segment: EditorSegment,
   markerNumber = 0,
   activeMarkerId: number | null = null,
+  isTerminalMarker = false,
 ) => {
   if (segment.type === 'text') {
     return escapeHtml(segment.text)
@@ -789,7 +1506,7 @@ const segmentToHtml = (
 
   return segment.type === 'number'
     ? numberToHtml(segment)
-    : markerToHtml(segment, markerNumber, activeMarkerId)
+    : markerToHtml(segment, markerNumber, activeMarkerId, isTerminalMarker)
 }
 
 const contentToHtml = (
@@ -803,6 +1520,7 @@ const contentToHtml = (
   let cursor = 0
   let html = ''
   let markerNumber = 0
+  const contentText = getContentText(content)
 
   const getClassName = (start: number, end: number) =>
     activeHighlights
@@ -824,18 +1542,37 @@ const contentToHtml = (
     const segmentClassName = getClassName(segmentStart, segmentEnd)
     const currentMarkerNumber =
       segment.type === 'marker' ? (markerNumber += 1) : markerNumber
+    const isTerminalMarker =
+      segment.type === 'marker' &&
+      currentMarkerNumber > 1 &&
+      !contentText.slice(segmentEnd).trim()
 
     if (!activeHighlights.length || !segmentClassName) {
-      html += segmentToHtml(segment, currentMarkerNumber, activeMarkerId)
+      html += segmentToHtml(
+        segment,
+        currentMarkerNumber,
+        activeMarkerId,
+        isTerminalMarker,
+      )
       return
     }
 
     if (segment.type !== 'text') {
       html +=
         segment.type === 'marker'
-          ? segmentToHtml(segment, currentMarkerNumber, activeMarkerId)
+          ? segmentToHtml(
+              segment,
+              currentMarkerNumber,
+              activeMarkerId,
+              isTerminalMarker,
+            )
           : wrapHtml(
-              segmentToHtml(segment, currentMarkerNumber, activeMarkerId),
+              segmentToHtml(
+                segment,
+                currentMarkerNumber,
+                activeMarkerId,
+                isTerminalMarker,
+              ),
               segmentClassName,
             )
       return
@@ -1071,24 +1808,6 @@ const completeFinalFindingInContent = (content: EditorSegment[]) => {
     : content
 }
 
-const cloneSegment = (segment: EditorSegment): EditorSegment =>
-  segment.type === 'text'
-    ? createTextSegment(segment.text)
-    : segment.type === 'variant'
-      ? {
-          ...segment,
-          id: createSegmentId(),
-          options: [...segment.options],
-        }
-      : segment.type === 'number'
-        ? createNumericSegment(segment.value)
-        : {
-            ...segment,
-            id: createSegmentId(),
-            title: segment.title ?? '',
-            options: segment.options.map((option) => ({ ...option })),
-          }
-
 const copySegment = (segment: EditorSegment): EditorSegment => {
   if (segment.type === 'text') {
     return { ...segment }
@@ -1172,45 +1891,6 @@ const syncSeedsFromTemplate = (template: ProtocolTemplate) => {
   )
 }
 
-const sliceContentRange = (
-  content: EditorSegment[],
-  start: number,
-  end: number,
-) => {
-  let cursor = 0
-  const selectedContent: EditorSegment[] = []
-
-  content.forEach((segment) => {
-    const text = segmentToText(segment)
-    const segmentStart = cursor
-    const segmentEnd = cursor + text.length
-    cursor = segmentEnd
-
-    if (segmentEnd <= start || segmentStart >= end) {
-      return
-    }
-
-    if (segment.type === 'marker') {
-      return
-    }
-
-    if (segment.type === 'variant' || segment.type === 'number') {
-      selectedContent.push(cloneSegment(segment))
-      return
-    }
-
-    const selectedStart = Math.max(0, start - segmentStart)
-    const selectedEnd = Math.min(text.length, end - segmentStart)
-    const selectedText = text.slice(selectedStart, selectedEnd)
-
-    if (selectedText) {
-      selectedContent.push(createTextSegment(selectedText))
-    }
-  })
-
-  return compactContent(selectedContent)
-}
-
 const appendContent = (
   targetContent: EditorSegment[],
   contentToAppend: EditorSegment[],
@@ -1288,6 +1968,21 @@ const getMarkerRanges = (content: EditorSegment[]) => {
   })
 
   return ranges
+}
+
+const getTerminalMarkerRange = (content: EditorSegment[]) => {
+  const text = getContentText(content)
+  const markerRanges = getMarkerRanges(content)
+
+  if (markerRanges.length < 2) {
+    return null
+  }
+
+  const lastMarkerRange = markerRanges.at(-1)
+
+  return lastMarkerRange && !text.slice(lastMarkerRange.end).trim()
+    ? lastMarkerRange
+    : null
 }
 
 const getLeadingMarkerRange = (content: EditorSegment[]) => {
@@ -1400,7 +2095,7 @@ const tokenizeNumericTextSegments = (content: EditorSegment[]) =>
       }
 
       const segments: EditorSegment[] = []
-      const numericPattern = /( )(\d+(?:[.,]\d+)?)(?= )/g
+      const numericPattern = createNumericTokenPattern()
       let cursor = 0
       let match = numericPattern.exec(segment.text)
 
@@ -2155,6 +2850,33 @@ const sanitizePassportData = (value: unknown): PassportData => {
   }
 }
 
+const sanitizePassportCustomFieldDefinitions = (value: unknown) =>
+  mergePassportCustomFieldDefinitions(
+    Array.isArray(value)
+      ? value.flatMap((field): PassportCustomFieldDefinition[] => {
+          if (!isRecord(field)) {
+            return []
+          }
+
+          const label = sanitizeString(field.label).trim()
+
+          if (!label) {
+            return []
+          }
+
+          return [
+            {
+              id:
+                typeof field.id === 'string' && field.id
+                  ? field.id
+                  : createPassportFieldId(),
+              label,
+            },
+          ]
+        })
+      : [],
+  )
+
 const sanitizeOpenProtocolSession = (
   value: unknown,
 ): OpenProtocolSession | null => {
@@ -2260,17 +2982,33 @@ const createEmptyStartTemplateDraft = () => ({
 type ProtocolSaveNotice = {
   fileName: string
   message: string
-  openUrl: string
+}
+
+type MarkerOptionSelection = {
+  markerId: number
+  optionIndex: number
+  start: number
+  end: number
+  text: string
+}
+
+type ActiveMarkerOptionVariant = {
+  markerId: number
+  optionIndex: number
+  start: number
+  end: number
 }
 
 function App() {
   const workspaceRef = useRef<HTMLElement>(null)
   const descriptionRef = useRef<HTMLDivElement>(null)
   const conclusionRef = useRef<HTMLDivElement>(null)
+  const markerOptionTitleRefs = useRef(new Map<string, HTMLInputElement>())
+  const markerOptionValueRefs = useRef(new Map<string, HTMLDivElement>())
+  const markerOptionSelectionRef = useRef<MarkerOptionSelection | null>(null)
   const pendingSelectionRef = useRef<PendingSelection | null>(null)
   const lastActiveEditorRef = useRef<FieldName | null>(null)
   const lastDescriptionSelectionRef = useRef<PendingSelection | null>(null)
-  const protocolOpenUrlRef = useRef<string | null>(null)
   const activeIncompleteFindingRef = useRef<{
     field: FieldName
     range: TextRange
@@ -2298,6 +3036,10 @@ function App() {
   const [passportData, setPassportData] = useState<PassportData>(
     createDefaultPassportData,
   )
+  const [
+    passportCustomFieldDefinitions,
+    setPassportCustomFieldDefinitions,
+  ] = useState<PassportCustomFieldDefinition[]>([])
   const [templateName, setTemplateName] = useState('')
   const [currentTemplateId, setCurrentTemplateId] = useState<string | null>(
     null,
@@ -2375,7 +3117,11 @@ function App() {
   const [findingBrowserWarning, setFindingBrowserWarning] = useState('')
   const [activeMarker, setActiveMarker] = useState<ActiveMarker | null>(null)
   const [markerDialogId, setMarkerDialogId] = useState<number | null>(null)
+  const [pendingMarkerOptionTitleFocus, setPendingMarkerOptionTitleFocus] =
+    useState<{ markerId: number; optionIndex: number } | null>(null)
   const [activeVariant, setActiveVariant] = useState<ActiveVariant | null>(null)
+  const [activeMarkerOptionVariant, setActiveMarkerOptionVariant] =
+    useState<ActiveMarkerOptionVariant | null>(null)
   const [activePairId, setActivePairId] = useState<number | null>(null)
   const [highlightedPairId, setHighlightedPairId] = useState<number | null>(null)
   const [activeCursorField, setActiveCursorField] = useState<FieldName | null>(
@@ -2494,6 +3240,29 @@ function App() {
       }) as CSSProperties,
     [conclusionPanelHeight, sidePanelWidth],
   )
+  const protocolHeaderEditorStyle = useMemo(
+    () =>
+      ({
+        fontFamily: `"${protocolExportSettingsDraft.documentFontFamily}", serif`,
+        fontSize: `${protocolExportSettingsDraft.headerFontSize}pt`,
+        fontStyle: protocolExportSettingsDraft.headerItalic
+          ? 'italic'
+          : 'normal',
+        fontWeight: protocolExportSettingsDraft.headerBold ? 700 : 400,
+        textAlign: protocolExportSettingsDraft.headerAlign,
+        textDecoration: protocolExportSettingsDraft.headerUnderline
+          ? 'underline'
+          : 'none',
+      }) as CSSProperties,
+    [
+      protocolExportSettingsDraft.documentFontFamily,
+      protocolExportSettingsDraft.headerAlign,
+      protocolExportSettingsDraft.headerBold,
+      protocolExportSettingsDraft.headerFontSize,
+      protocolExportSettingsDraft.headerItalic,
+      protocolExportSettingsDraft.headerUnderline,
+    ],
+  )
   const highlightedPair = useMemo(
     () => findingPairs.find((pair) => pair.id === highlightedPairId) ?? null,
     [findingPairs, highlightedPairId],
@@ -2517,6 +3286,36 @@ function App() {
     )
   }, [activeVariant, conclusionContent, descriptionContent])
 
+  const activeMarkerOptionVariantSegment = useMemo(() => {
+    if (!activeMarkerOptionVariant) {
+      return null
+    }
+
+    const markerSegment = descriptionContent.find(
+      (segment): segment is MarkerSegment =>
+        segment.type === 'marker' &&
+        segment.id === activeMarkerOptionVariant.markerId,
+    )
+    const blockInfo = getMarkerBlockInfo(
+      descriptionContent,
+      activeMarkerOptionVariant.markerId,
+    )
+    const value = markerSegment
+      ? getMarkerOptionState(markerSegment, blockInfo).options[
+          activeMarkerOptionVariant.optionIndex
+        ]?.value ?? ''
+      : ''
+
+    return parseMarkerOptionVariantToken(
+      value,
+      activeMarkerOptionVariant.start,
+      activeMarkerOptionVariant.end,
+    )
+  }, [activeMarkerOptionVariant, descriptionContent])
+
+  const visibleVariantSegment =
+    activeMarkerOptionVariantSegment ?? activeVariantSegment
+
   const markerMenuSegment = useMemo(() => {
     if (!markerMenu) {
       return null
@@ -2529,6 +3328,22 @@ function App() {
       ) ?? null
     )
   }, [descriptionContent, markerMenu])
+
+  const markerMenuBlock = useMemo(() => {
+    if (!markerMenu) {
+      return null
+    }
+
+    return getMarkerBlockInfo(descriptionContent, markerMenu.id)
+  }, [descriptionContent, markerMenu])
+
+  const markerMenuOptions = useMemo(
+    () =>
+      markerMenuSegment
+        ? getMarkerOptionState(markerMenuSegment, markerMenuBlock).options
+        : [],
+    [markerMenuBlock, markerMenuSegment],
+  )
 
   const markerContextMenuSegment = useMemo(() => {
     if (!markerContextMenu) {
@@ -2555,6 +3370,41 @@ function App() {
     )
   }, [descriptionContent, markerContextMenu])
 
+  const markerContextMenuBlock = useMemo(() => {
+    if (!markerContextMenu) {
+      return null
+    }
+
+    return getMarkerBlockInfo(descriptionContent, markerContextMenu.id)
+  }, [descriptionContent, markerContextMenu])
+
+  const markerContextMenuOptionState = useMemo(
+    () =>
+      markerContextMenuSegment
+        ? getMarkerOptionState(
+            markerContextMenuSegment,
+            markerContextMenuBlock,
+          )
+        : { options: [], selectedOptionIndex: null },
+    [markerContextMenuBlock, markerContextMenuSegment],
+  )
+  const markerContextMenuSelectedOptionIndex = getResolvedMarkerOptionIndex(
+    markerContextMenuOptionState,
+    markerContextMenuBlock,
+  )
+  const markerContextMenuSelectedOption =
+    markerContextMenuSelectedOptionIndex === null
+      ? null
+      : markerContextMenuOptionState.options[
+          markerContextMenuSelectedOptionIndex
+        ] ?? null
+  const markerContextMenuSelectedOptionLabel = markerContextMenuSelectedOption
+    ? getMarkerOptionLabel(
+        markerContextMenuSelectedOption,
+        markerContextMenuSelectedOptionIndex ?? 0,
+      )
+    : 'Не выбрана'
+
   const markerDialogSegment = useMemo(() => {
     if (markerDialogId === null) {
       return null
@@ -2576,15 +3426,29 @@ function App() {
     return getMarkerBlockInfo(descriptionContent, markerDialogId)
   }, [descriptionContent, markerDialogId])
 
+  const markerDialogOptionState = useMemo(
+    () =>
+      markerDialogSegment
+        ? getMarkerOptionState(markerDialogSegment, markerDialogBlock)
+        : { options: [], selectedOptionIndex: null },
+    [markerDialogBlock, markerDialogSegment],
+  )
+  const markerDialogOptions = markerDialogOptionState.options
+  const shouldShowMarkerBoundaryReminder = Boolean(
+    markerDialogBlock &&
+      !markerDialogBlock.hasNextMarker &&
+      markerDialogOptions.length === 0,
+  )
+
   const descriptionHighlights = useMemo(() => {
     const highlights: HighlightRange[] = changedDescriptionRanges.flatMap(
-      (range) => {
-        const trimmedRange = trimRangeWhitespace(descriptionText, range)
-
-        return trimmedRange
-          ? [{ ...trimmedRange, className: 'protocol-change' }]
-          : []
-      },
+      (range) =>
+        getProtocolChangeHighlightRanges(descriptionText, range).map(
+          (highlightRange) => ({
+            ...highlightRange,
+            className: 'protocol-change',
+          }),
+        ),
     )
 
     if (highlightedPair) {
@@ -2609,13 +3473,13 @@ function App() {
 
   const conclusionHighlights = useMemo(() => {
     const highlights: HighlightRange[] = changedConclusionRanges.flatMap(
-      (range) => {
-        const trimmedRange = trimRangeWhitespace(conclusionText, range)
-
-        return trimmedRange
-          ? [{ ...trimmedRange, className: 'protocol-change' }]
-          : []
-      },
+      (range) =>
+        getProtocolChangeHighlightRanges(conclusionText, range).map(
+          (highlightRange) => ({
+            ...highlightRange,
+            className: 'protocol-change',
+          }),
+        ),
     )
 
     if (
@@ -2733,6 +3597,26 @@ function App() {
     highlightedPair,
   ])
 
+  useLayoutEffect(() => {
+    if (!pendingMarkerOptionTitleFocus) {
+      return
+    }
+
+    const key = getMarkerOptionTextareaKey(
+      pendingMarkerOptionTitleFocus.markerId,
+      pendingMarkerOptionTitleFocus.optionIndex,
+    )
+    const input = markerOptionTitleRefs.current.get(key)
+
+    if (!input) {
+      return
+    }
+
+    input.focus()
+    input.select()
+    setPendingMarkerOptionTitleFocus(null)
+  }, [markerDialogOptions, pendingMarkerOptionTitleFocus])
+
   useEffect(() => {
     let isMounted = true
 
@@ -2750,15 +3634,6 @@ function App() {
       isMounted = false
     }
   }, [isProtocolDirectorySaveAvailable])
-
-  useEffect(
-    () => () => {
-      if (protocolOpenUrlRef.current) {
-        window.URL.revokeObjectURL(protocolOpenUrlRef.current)
-      }
-    },
-    [],
-  )
 
   useEffect(() => {
     if (!protocolSaveNotice) {
@@ -2896,6 +3771,25 @@ function App() {
     setContextMenu(selection)
   }
 
+  const rememberMarkerOptionSelection = (
+    markerId: number,
+    optionIndex: number,
+    editor: HTMLDivElement,
+  ) => {
+    const selection = getSelectionOffsets(editor)
+    const start = selection?.start ?? editor.textContent?.length ?? 0
+    const end = selection?.end ?? start
+
+    setContextMenu(null)
+    markerOptionSelectionRef.current = {
+      end,
+      markerId,
+      optionIndex,
+      start,
+      text: selection?.text ?? '',
+    }
+  }
+
   const getCurrentContent = (field: FieldName) =>
     field === 'description' ? descriptionContent : conclusionContent
 
@@ -2910,6 +3804,17 @@ function App() {
       : freshContent
   }
 
+  const applyPassportFieldDefinitionsToSession = (
+    session: OpenProtocolSession,
+    definitions = passportCustomFieldDefinitions,
+  ): OpenProtocolSession => ({
+    ...session,
+    passportData: applyPassportCustomFieldDefinitions(
+      session.passportData,
+      definitions,
+    ),
+  })
+
   const upsertProtocolSession = (
     sessions: OpenProtocolSession[],
     session: OpenProtocolSession,
@@ -2922,7 +3827,12 @@ function App() {
     sessionId = activeProtocolSessionId ?? createProtocolSessionId(),
   ): OpenProtocolSession => ({
     id: sessionId,
-    passportData: copyPassportData(passportData),
+    passportData: copyPassportData(
+      applyPassportCustomFieldDefinitions(
+        passportData,
+        passportCustomFieldDefinitions,
+      ),
+    ),
     templateName,
     currentTemplateId,
     descriptionContent: copyContent(getFreshContent('description')),
@@ -2958,6 +3868,9 @@ function App() {
       findingFolders: findingFolders.map((folder) => ({ ...folder })),
       hasOpenedProtocol,
       openProtocolSessions: sessions,
+      passportCustomFields: passportCustomFieldDefinitions.map((field) => ({
+        ...field,
+      })),
       protocolExportSettings: { ...protocolExportSettings },
       savedFindings: savedFindings.map((finding) => ({ ...finding })),
       templates: templates.map((template) => ({
@@ -2992,11 +3905,24 @@ function App() {
     const nextExportSettings = sanitizeProtocolExportSettings(
       snapshot.protocolExportSettings,
     )
-    const nextSessions = snapshot.openProtocolSessions.flatMap((item) => {
+    const sanitizedSessions = snapshot.openProtocolSessions.flatMap((item) => {
       const session = sanitizeOpenProtocolSession(item)
 
       return session ? [session] : []
     })
+    const nextPassportCustomFieldDefinitions =
+      mergePassportCustomFieldDefinitions(
+        sanitizePassportCustomFieldDefinitions(snapshot.passportCustomFields),
+        ...sanitizedSessions.map((session) =>
+          getPassportCustomFieldDefinitions(session.passportData),
+        ),
+      )
+    const nextSessions = sanitizedSessions.map((session) =>
+      applyPassportFieldDefinitionsToSession(
+        session,
+        nextPassportCustomFieldDefinitions,
+      ),
+    )
     const activeSession =
       nextSessions.find(
         (session) => session.id === snapshot.activeProtocolSessionId,
@@ -3009,11 +3935,12 @@ function App() {
     setFindingFolders(nextFindingFolders)
     setProtocolExportSettings(nextExportSettings)
     setProtocolExportSettingsDraft(nextExportSettings)
+    setPassportCustomFieldDefinitions(nextPassportCustomFieldDefinitions)
     setOpenProtocolSessions(nextSessions)
     setProtocolSessionCloseId(null)
 
     if (snapshot.hasOpenedProtocol && activeSession) {
-      applyProtocolSession(activeSession)
+      applyProtocolSession(activeSession, nextPassportCustomFieldDefinitions)
       return
     }
 
@@ -3077,6 +4004,7 @@ function App() {
     hasOpenedProtocol,
     newDescriptionRanges,
     openProtocolSessions,
+    passportCustomFieldDefinitions,
     passportData,
     protocolExportSettings,
     savedFindings,
@@ -3100,32 +4028,42 @@ function App() {
     return session.id
   }
 
-  function applyProtocolSession(session: OpenProtocolSession) {
+  function applyProtocolSession(
+    session: OpenProtocolSession,
+    definitions = passportCustomFieldDefinitions,
+  ) {
+    const normalizedSession = applyPassportFieldDefinitionsToSession(
+      session,
+      definitions,
+    )
+
     syncSeedsFromProtocolContent(
-      session.descriptionContent,
-      session.conclusionContent,
-      session.findingPairs,
+      normalizedSession.descriptionContent,
+      normalizedSession.conclusionContent,
+      normalizedSession.findingPairs,
     )
     pendingSelectionRef.current = null
     lastActiveEditorRef.current = null
     lastDescriptionSelectionRef.current = null
     activeIncompleteFindingRef.current = null
-    setDescriptionContent(copyContent(session.descriptionContent))
-    setConclusionContent(copyContent(session.conclusionContent))
-    setPassportData(copyPassportData(session.passportData))
-    setFindingPairs(session.findingPairs.map(copyFindingPair))
-    setNewDescriptionRanges(session.newDescriptionRanges.map(copyTextRange))
+    setDescriptionContent(copyContent(normalizedSession.descriptionContent))
+    setConclusionContent(copyContent(normalizedSession.conclusionContent))
+    setPassportData(copyPassportData(normalizedSession.passportData))
+    setFindingPairs(normalizedSession.findingPairs.map(copyFindingPair))
+    setNewDescriptionRanges(
+      normalizedSession.newDescriptionRanges.map(copyTextRange),
+    )
     setChangedDescriptionRanges(
-      session.changedDescriptionRanges.map(copyTextRange),
+      normalizedSession.changedDescriptionRanges.map(copyTextRange),
     )
     setChangedConclusionRanges(
-      session.changedConclusionRanges.map(copyTextRange),
+      normalizedSession.changedConclusionRanges.map(copyTextRange),
     )
-    setHasLoadedTemplate(session.hasLoadedTemplate)
+    setHasLoadedTemplate(normalizedSession.hasLoadedTemplate)
     setHasOpenedProtocol(true)
-    setTemplateName(session.templateName)
-    setCurrentTemplateId(session.currentTemplateId)
-    setActiveProtocolSessionId(session.id)
+    setTemplateName(normalizedSession.templateName)
+    setCurrentTemplateId(normalizedSession.currentTemplateId)
+    setActiveProtocolSessionId(normalizedSession.id)
     setContextMenu(null)
     setMarkerMenu(null)
     setMarkerContextMenu(null)
@@ -3269,26 +4207,51 @@ function App() {
       return
     }
 
-    const field: PassportCustomField = {
-      id: createPassportFieldId(),
-      label,
-      value: '',
+    if (
+      passportCustomFieldDefinitions.some(
+        (field) => field.label.trim().toLocaleLowerCase('ru-RU') ===
+          label.toLocaleLowerCase('ru-RU'),
+      )
+    ) {
+      setPassportCustomFieldDraft(null)
+      return
     }
 
-    setPassportData((currentData) => ({
-      ...currentData,
-      customFields: [...currentData.customFields, field],
-    }))
+    const field: PassportCustomFieldDefinition = {
+      id: createPassportFieldId(),
+      label,
+    }
+    const nextDefinitions = mergePassportCustomFieldDefinitions(
+      passportCustomFieldDefinitions,
+      [field],
+    )
+
+    setPassportCustomFieldDefinitions(nextDefinitions)
+    setPassportData((currentData) =>
+      applyPassportCustomFieldDefinitions(currentData, nextDefinitions),
+    )
+    setOpenProtocolSessions((sessions) =>
+      sessions.map((session) =>
+        applyPassportFieldDefinitionsToSession(session, nextDefinitions),
+      ),
+    )
     setPassportCustomFieldDraft(null)
   }
 
   const deletePassportCustomField = (id: string) => {
-    setPassportData((currentData) => ({
-      ...currentData,
-      customFields: currentData.customFields.filter(
-        (customField) => customField.id !== id,
+    const nextDefinitions = passportCustomFieldDefinitions.filter(
+      (field) => field.id !== id,
+    )
+
+    setPassportCustomFieldDefinitions(nextDefinitions)
+    setPassportData((currentData) =>
+      applyPassportCustomFieldDefinitions(currentData, nextDefinitions),
+    )
+    setOpenProtocolSessions((sessions) =>
+      sessions.map((session) =>
+        applyPassportFieldDefinitionsToSession(session, nextDefinitions),
       ),
-    }))
+    )
   }
 
   const updatePassportCustomField = (
@@ -3296,6 +4259,20 @@ function App() {
     field: 'label' | 'value',
     value: string,
   ) => {
+    if (field === 'label') {
+      const nextDefinitions = passportCustomFieldDefinitions.map(
+        (customField) =>
+          customField.id === id ? { ...customField, label: value } : customField,
+      )
+
+      setPassportCustomFieldDefinitions(nextDefinitions)
+      setOpenProtocolSessions((sessions) =>
+        sessions.map((session) =>
+          applyPassportFieldDefinitionsToSession(session, nextDefinitions),
+        ),
+      )
+    }
+
     setPassportData((currentData) => ({
       ...currentData,
       customFields: currentData.customFields.map((customField) =>
@@ -3865,18 +4842,14 @@ function App() {
     updateContent(field, () => normalizedContent)
 
     if (change) {
-      const delta =
-        change.nextRange.end -
-        change.nextRange.start -
-        (change.previousRange.end - change.previousRange.start)
+      const delta = getTextChangeDelta(change)
 
       if (delta !== 0) {
         setFindingPairs((pairs) =>
-          adjustPairsForFieldEdit(
+          adjustPairsForFieldTextChange(
             pairs,
             field,
-            change.previousRange.start,
-            delta,
+            change,
             activePairId,
             nextText,
           ),
@@ -4007,6 +4980,66 @@ function App() {
       nextText,
       true,
     )
+  }
+
+  const insertSpaceAfterVariantToken = (
+    field: FieldName,
+    editor: HTMLElement,
+    variantToken: HTMLElement,
+  ) => {
+    const variantRange = getElementTextRange(editor, variantToken)
+    const currentContent = parseEditorContent(editor, getCurrentContent(field))
+    const currentText = getContentText(currentContent)
+    const nextChar = currentText[variantRange.end]
+
+    if (nextChar === ' ') {
+      restoreSelection(editor, variantRange.end + 1, variantRange.end + 1)
+      setActiveVariant(null)
+      return
+    }
+
+    const nextContent = insertContentAtOffset(currentContent, variantRange.end, [
+      createTextSegment(' '),
+    ])
+    const normalizedContent =
+      field === 'description' ? ensureLeadingMarkerContent(nextContent) : nextContent
+    const nextText = getContentText(normalizedContent)
+    const nextOffset = Math.min(variantRange.end + 1, nextText.length)
+
+    updateContent(field, () => normalizedContent)
+    setFindingPairs((pairs) =>
+      adjustPairsForFieldEdit(
+        pairs,
+        field,
+        variantRange.end,
+        1,
+        activePairId,
+        nextText,
+      ),
+    )
+
+    if (field === 'description') {
+      setNewDescriptionRanges((ranges) =>
+        adjustTrackedRangesForEdit(ranges, variantRange.end, 1),
+      )
+      if (hasLoadedTemplate) {
+        setChangedDescriptionRanges((ranges) =>
+          adjustTrackedRangesForEdit(ranges, variantRange.end, 1),
+        )
+      }
+    } else if (hasLoadedTemplate) {
+      setChangedConclusionRanges((ranges) =>
+        adjustTrackedRangesForEdit(ranges, variantRange.end, 1),
+      )
+    }
+
+    pendingSelectionRef.current = createPendingSelection(
+      field,
+      { start: nextOffset, end: nextOffset },
+      nextText,
+      true,
+    )
+    setActiveVariant(null)
   }
 
   const getInteractiveItems = () => {
@@ -4168,17 +5201,17 @@ function App() {
       rememberDescriptionSelection(rawSelection, nextEditorText)
     }
 
+    const editAnchor = textChange?.previousRange.start ?? editStart
     const pairAtEdit = selection
-      ? findPairAtOffset(findingPairs, field, editStart)
+      ? findPairAtOffset(findingPairs, field, editAnchor)
       : null
     const pairIdForEdit = activePairId ?? pairAtEdit?.id ?? null
     const adjustedPairs =
-      selection && textDelta !== 0
-        ? adjustPairsForFieldEdit(
+      selection && textChange
+        ? adjustPairsForFieldTextChange(
             findingPairs,
             field,
-            editStart,
-            textDelta,
+            textChange,
             pairIdForEdit,
             nextEditorText,
           )
@@ -4348,7 +5381,24 @@ function App() {
       ? currentInteractiveToken
       : null
 
-    if (token && (event.key === 'Enter' || event.key === ' ')) {
+    if (token && editor && event.key === ' ') {
+      const selectionOffsets = getSelectionOffsets(editor)
+      const tokenRange = getElementTextRange(editor, token)
+
+      if (
+        selectionOffsets &&
+        selectionOffsets.start === selectionOffsets.end
+      ) {
+        if (selectionOffsets.end >= tokenRange.end) {
+          event.preventDefault()
+          insertSpaceAfterVariantToken(field, editor, token)
+        }
+
+        return
+      }
+    }
+
+    if (token && event.key === 'Enter') {
       const id = Number(token.dataset.variantId)
 
       if (!Number.isNaN(id)) {
@@ -4463,6 +5513,10 @@ function App() {
   const createVariantFromSelection = () => {
     const actionSelection = getActionSelection()
 
+    if (!actionSelection && createMarkerOptionVariantFromSelection()) {
+      return
+    }
+
     if (!actionSelection) {
       return
     }
@@ -4535,90 +5589,11 @@ function App() {
     }
     setContextMenu(null)
     setMarkerMenu(null)
+    setActiveMarkerOptionVariant(null)
     setActiveVariant({
       field: actionSelection.field,
       id: variant.id,
     })
-  }
-
-  const copySelectionToConclusion = () => {
-    const actionSelection = getActionSelection('description')
-
-    if (!actionSelection) {
-      return
-    }
-
-    const sourceContent = getFreshContent(actionSelection.field)
-    const copiedContent = sliceContentRange(
-      sourceContent,
-      actionSelection.start,
-      actionSelection.end,
-    )
-
-    if (!getContentText(copiedContent).trim()) {
-      return
-    }
-
-    const sourceText = getContentText(sourceContent)
-    const sourceFindingRange =
-      getTrackedFindingRangeAtOffset(
-        sourceText,
-        actionSelection.start,
-        newDescriptionRanges,
-      ) ??
-      {
-        start: actionSelection.start,
-        end: actionSelection.end,
-      }
-    const existingPair = findPairForDescription(sourceFindingRange)
-    const existingConclusionText = existingPair
-      ? getRangeText(conclusionText, existingPair.conclusion).trim()
-      : ''
-
-    if (existingPair && existingConclusionText) {
-      setActivePairId(existingPair.id)
-      setContextMenu(null)
-      setActiveVariant(null)
-      return
-    }
-
-    const conclusionEditor = getEditor('conclusion')
-    const freshConclusionContent = conclusionEditor
-      ? parseEditorContent(conclusionEditor, conclusionContent)
-      : conclusionContent
-    const appendResult = appendContent(freshConclusionContent, copiedContent)
-    const pairId = existingPair?.id ?? createPairId()
-
-    setConclusionContent(appendResult.content)
-    if (hasLoadedTemplate && appendResult.range.end > appendResult.range.start) {
-      setChangedConclusionRanges((ranges) =>
-        mergeTextRanges([...ranges, appendResult.range]),
-      )
-    }
-    setFindingPairs((pairs) =>
-      existingPair
-        ? pairs.map((pair) =>
-            pair.id === existingPair.id
-              ? {
-                  ...pair,
-                  description: sourceFindingRange,
-                  conclusion: appendResult.range,
-                }
-              : pair,
-          )
-        : [
-            ...pairs,
-            {
-              id: pairId,
-              description: sourceFindingRange,
-              conclusion: appendResult.range,
-            },
-          ],
-    )
-    setActivePairId(pairId)
-    setContextMenu(null)
-    setMarkerMenu(null)
-    setActiveVariant(null)
   }
 
   const activateFindingCapsule = (range: TextRange) => {
@@ -4696,6 +5671,7 @@ function App() {
     setContextMenu(null)
     setMarkerMenu(null)
     setActiveMarker(null)
+    setActiveMarkerOptionVariant(null)
     setActiveVariant({
       field,
       id,
@@ -4724,6 +5700,10 @@ function App() {
       )
 
       if (!Number.isNaN(id) && markerSegment) {
+        const markerBlock = getMarkerBlockInfo(descriptionContent, id)
+        const options = getMarkerOptionState(markerSegment, markerBlock).options
+
+        ensureMarkerStandardOption(id)
         setActiveMarker({ id })
         setActiveVariant(null)
         setContextMenu(null)
@@ -4734,7 +5714,7 @@ function App() {
             event.clientX,
             event.clientY,
             260,
-            Math.min(320, Math.max(1, markerSegment.options.length) * 40 + 12),
+            Math.min(320, Math.max(1, options.length) * 40 + 12),
           ),
         })
       }
@@ -4810,18 +5790,14 @@ function App() {
     }
 
     if (change) {
-      const delta =
-        change.nextRange.end -
-        change.nextRange.start -
-        (change.previousRange.end - change.previousRange.start)
+      const delta = getTextChangeDelta(change)
 
       if (delta !== 0) {
         setFindingPairs((pairs) =>
-          adjustPairsForFieldEdit(
+          adjustPairsForFieldTextChange(
             pairs,
             field,
-            change.previousRange.start,
-            delta,
+            change,
             activePairId,
             nextText,
           ),
@@ -4832,7 +5808,75 @@ function App() {
     updateContent(field, () => nextContent)
   }
 
+  const updateActiveMarkerOptionVariant = (
+    updater: (variant: { value: string; options: string[] }) => {
+      value: string
+      options: string[]
+    },
+  ) => {
+    if (!activeMarkerOptionVariant || !activeMarkerOptionVariantSegment) {
+      return
+    }
+
+    const markerSegment = descriptionContent.find(
+      (segment): segment is MarkerSegment =>
+        segment.type === 'marker' &&
+        segment.id === activeMarkerOptionVariant.markerId,
+    )
+    const blockInfo = getMarkerBlockInfo(
+      descriptionContent,
+      activeMarkerOptionVariant.markerId,
+    )
+    const option = markerSegment
+      ? getMarkerOptionState(markerSegment, blockInfo).options[
+          activeMarkerOptionVariant.optionIndex
+        ] ?? null
+      : null
+
+    if (!option) {
+      return
+    }
+
+    const nextVariant = updater({
+      options: [...activeMarkerOptionVariantSegment.options],
+      value: activeMarkerOptionVariantSegment.value,
+    })
+    const normalizedOptions = nextVariant.options.length
+      ? nextVariant.options
+      : [nextVariant.value]
+    const nextToken = createMarkerOptionVariantToken(normalizedOptions)
+    const nextValue = `${option.value.slice(
+      0,
+      activeMarkerOptionVariant.start,
+    )}${nextToken}${option.value.slice(activeMarkerOptionVariant.end)}`
+
+    changeMarkerOptionValue(
+      activeMarkerOptionVariant.markerId,
+      activeMarkerOptionVariant.optionIndex,
+      nextValue,
+    )
+    setActiveMarkerOptionVariant({
+      ...activeMarkerOptionVariant,
+      end: activeMarkerOptionVariant.start + nextToken.length,
+    })
+  }
+
   const chooseVariantOption = (index: number) => {
+    if (activeMarkerOptionVariant) {
+      updateActiveMarkerOptionVariant((variant) => {
+        const selectedOption = variant.options[index] ?? variant.value
+
+        return {
+          options: [
+            selectedOption,
+            ...variant.options.filter((_, optionIndex) => optionIndex !== index),
+          ],
+          value: selectedOption,
+        }
+      })
+      return
+    }
+
     if (!activeVariant) {
       return
     }
@@ -4849,6 +5893,17 @@ function App() {
   }
 
   const changeVariantOption = (index: number, value: string) => {
+    if (activeMarkerOptionVariant) {
+      updateActiveMarkerOptionVariant((variant) => ({
+        ...variant,
+        options: variant.options.map((option, optionIndex) =>
+          optionIndex === index ? value : option,
+        ),
+        value: index === 0 ? value : variant.value,
+      }))
+      return
+    }
+
     if (!activeVariant) {
       return
     }
@@ -4872,7 +5927,67 @@ function App() {
     )
   }
 
+  const deleteVariantOption = (index: number) => {
+    if (activeMarkerOptionVariant) {
+      updateActiveMarkerOptionVariant((variant) => {
+        if (variant.options.length <= 1) {
+          return variant
+        }
+
+        const options = variant.options.filter(
+          (_, optionIndex) => optionIndex !== index,
+        )
+
+        return {
+          options,
+          value: options[0] ?? variant.value,
+        }
+      })
+      return
+    }
+
+    if (!activeVariant) {
+      return
+    }
+
+    updateVariant(
+      activeVariant.field,
+      activeVariant.id,
+      (variant) => {
+        if (index < 0 || index >= variant.options.length) {
+          return variant
+        }
+
+        const deletedOption = variant.options[index]
+        const options = variant.options.filter(
+          (_, optionIndex) => optionIndex !== index,
+        )
+        const isSelectedOption = deletedOption === variant.value
+        const nextValue = isSelectedOption
+          ? options[Math.min(index, options.length - 1)] ?? variant.value
+          : variant.value
+
+        return {
+          ...variant,
+          options,
+          value: nextValue,
+        }
+      },
+      true,
+    )
+  }
+
   const addVariantOption = () => {
+    if (activeMarkerOptionVariant) {
+      updateActiveMarkerOptionVariant((variant) => ({
+        ...variant,
+        options: variant.options.includes('')
+          ? variant.options
+          : [...variant.options, ''],
+      }))
+      return
+    }
+
     if (!activeVariant) {
       return
     }
@@ -4891,32 +6006,42 @@ function App() {
     const text = getContentText(content)
     const selection = editor ? getSelectionOffsets(editor) : null
     const offset = selection?.end ?? text.length
+    const terminalMarkerRange = getTerminalMarkerRange(content)
+    const insertionOffset =
+      terminalMarkerRange && offset >= terminalMarkerRange.start
+        ? terminalMarkerRange.start
+        : offset
     const marker = createMarkerSegment()
-    const prefix = offset > 0 && text[offset - 1] !== '\n' ? '\n' : ''
+    const prefix =
+      insertionOffset > 0 && text[insertionOffset - 1] !== '\n' ? '\n' : ''
     const insertedContent: EditorSegment[] = prefix
       ? [createTextSegment(prefix), marker]
       : [marker]
     const insertedLength = prefix.length + markerText.length
-    const nextContent = insertContentAtOffset(content, offset, insertedContent)
+    const nextContent = insertContentAtOffset(
+      content,
+      insertionOffset,
+      insertedContent,
+    )
     const nextText = getContentText(nextContent)
-    const nextOffset = offset + insertedLength
+    const nextOffset = insertionOffset + insertedLength
 
     setDescriptionContent(ensureLeadingMarkerContent(nextContent))
     setFindingPairs((pairs) =>
       adjustPairsForFieldEdit(
         pairs,
         'description',
-        offset,
+        insertionOffset,
         insertedLength,
         activePairId,
         nextText,
       ),
     )
     setNewDescriptionRanges((ranges) =>
-      adjustTrackedRangesForEdit(ranges, offset, insertedLength),
+      adjustTrackedRangesForEdit(ranges, insertionOffset, insertedLength),
     )
     setChangedDescriptionRanges((ranges) =>
-      adjustTrackedRangesForEdit(ranges, offset, insertedLength),
+      adjustTrackedRangesForEdit(ranges, insertionOffset, insertedLength),
     )
     setActiveMarker({ id: marker.id })
     setActiveVariant(null)
@@ -4936,6 +6061,7 @@ function App() {
     id: number,
     value: string,
     selectedOptionIndex?: number | null,
+    options?: MarkerOption[],
   ) => {
     const content = descriptionContent
     const blockInfo = getMarkerBlockInfo(content, id)
@@ -4944,23 +6070,35 @@ function App() {
       return
     }
 
-    const replacementText =
-      blockInfo.hasNextMarker && !value.endsWith('\n') ? `${value}\n` : value
+    const replacementContent = parseMarkerTemplateContent(value)
+    const replacementText = getContentText(replacementContent)
+    const normalizedReplacementContent =
+      blockInfo.hasNextMarker && !replacementText.endsWith('\n')
+        ? [...replacementContent, createTextSegment('\n')]
+        : replacementContent
+    const normalizedReplacementText = getContentText(
+      normalizedReplacementContent,
+    )
     const nextContent = replaceRangeWithContent(
       content,
       blockInfo.blockStart,
       blockInfo.blockEnd,
-      replacementText ? [createTextSegment(replacementText)] : [],
+      normalizedReplacementContent,
     ).map((segment) =>
       segment.type === 'marker' &&
       segment.id === id &&
       selectedOptionIndex !== undefined
-        ? { ...segment, selectedOptionIndex }
+        ? {
+            ...segment,
+            options: options ?? segment.options,
+            selectedOptionIndex,
+          }
         : segment,
     )
     const nextText = getContentText(nextContent)
     const editDelta =
-      replacementText.length - (blockInfo.blockEnd - blockInfo.blockStart)
+      normalizedReplacementText.length -
+      (blockInfo.blockEnd - blockInfo.blockStart)
     const replacedRange = {
       start: blockInfo.blockStart,
       end: blockInfo.blockEnd,
@@ -5010,20 +6148,63 @@ function App() {
   ) => {
     setDescriptionContent((content) =>
       ensureLeadingMarkerContent(
-        content.map((segment) =>
-          segment.type === 'marker' && segment.id === id
-            ? {
-                ...segment,
-                options: updater(
-                  segment.options.length
-                    ? segment.options.map((option) => ({ ...option }))
-                    : [createEmptyMarkerOption()],
-                ),
-              }
-            : segment,
-        ),
+        content.map((segment) => {
+          if (segment.type !== 'marker' || segment.id !== id) {
+            return segment
+          }
+
+          const blockInfo = getMarkerBlockInfo(content, id)
+          const optionState = getMarkerOptionState(segment, blockInfo)
+          const options = updater(optionState.options.map(copyMarkerOption))
+          const selectedOptionIndex =
+            optionState.selectedOptionIndex !== null &&
+            optionState.selectedOptionIndex < options.length
+              ? optionState.selectedOptionIndex
+              : null
+
+          return {
+            ...segment,
+            options,
+            selectedOptionIndex,
+          }
+        }),
       ),
     )
+  }
+
+  const ensureMarkerStandardOption = (id: number) => {
+    setDescriptionContent((content) => {
+      const blockInfo = getMarkerBlockInfo(content, id)
+
+      if (!blockInfo?.hasNextMarker) {
+        return content
+      }
+
+      let changed = false
+      const nextContent = content.map((segment) => {
+        if (segment.type !== 'marker' || segment.id !== id) {
+          return segment
+        }
+
+        const optionState = getMarkerOptionState(segment, blockInfo)
+
+        if (
+          areMarkerOptionsEqual(segment.options, optionState.options) &&
+          segment.selectedOptionIndex === optionState.selectedOptionIndex
+        ) {
+          return segment
+        }
+
+        changed = true
+        return {
+          ...segment,
+          options: optionState.options,
+          selectedOptionIndex: optionState.selectedOptionIndex,
+        }
+      })
+
+      return changed ? ensureLeadingMarkerContent(nextContent) : content
+    })
   }
 
   const changeMarkerTitle = (id: number, title: string) => {
@@ -5062,24 +6243,244 @@ function App() {
     )
   }
 
+  const deleteMarkerOption = (markerId: number, index: number) => {
+    setDescriptionContent((content) =>
+      ensureLeadingMarkerContent(
+        content.map((segment) => {
+          if (segment.type !== 'marker' || segment.id !== markerId) {
+            return segment
+          }
+
+          const blockInfo = getMarkerBlockInfo(content, markerId)
+          const optionState = getMarkerOptionState(segment, blockInfo)
+          const optionToDelete = optionState.options[index]
+
+          if (!optionToDelete || !canDeleteMarkerOption(optionToDelete, blockInfo)) {
+            return segment
+          }
+
+          const options = optionState.options.filter(
+            (_, optionIndex) => optionIndex !== index,
+          )
+          const selectedOptionIndex =
+            optionState.selectedOptionIndex === null
+              ? null
+              : optionState.selectedOptionIndex === index
+                ? null
+                : optionState.selectedOptionIndex > index
+                  ? optionState.selectedOptionIndex - 1
+                  : optionState.selectedOptionIndex
+
+          return {
+            ...segment,
+            options,
+            selectedOptionIndex,
+          }
+        }),
+      ),
+    )
+
+    setActiveMarkerOptionVariant((current) => {
+      if (!current || current.markerId !== markerId) {
+        return current
+      }
+
+      if (current.optionIndex === index) {
+        return null
+      }
+
+      return current.optionIndex > index
+        ? { ...current, optionIndex: current.optionIndex - 1 }
+        : current
+    })
+
+    const rememberedSelection = markerOptionSelectionRef.current
+
+    if (
+      rememberedSelection?.markerId === markerId &&
+      rememberedSelection.optionIndex >= index
+    ) {
+      markerOptionSelectionRef.current = null
+    }
+
+    setPendingMarkerOptionTitleFocus((current) =>
+      current?.markerId === markerId && current.optionIndex >= index
+        ? null
+        : current,
+    )
+  }
+
+  const handleMarkerOptionValueInput = (
+    markerId: number,
+    index: number,
+    editor: HTMLDivElement,
+  ) => {
+    const selection = getSelectionOffsets(editor)
+    const nextValue = parseMarkerOptionEditorValue(editor)
+    const nextOffset = selection?.end ?? editor.textContent?.length ?? 0
+
+    changeMarkerOptionValue(markerId, index, nextValue)
+    markerOptionSelectionRef.current = {
+      end: nextOffset,
+      markerId,
+      optionIndex: index,
+      start: nextOffset,
+      text: '',
+    }
+    window.requestAnimationFrame(() => {
+      restoreSelection(editor, nextOffset, nextOffset)
+    })
+  }
+
+  const wrapMarkerOptionSelectionAsVariant = (
+    markerId: number,
+    index: number,
+  ) => {
+    const key = getMarkerOptionTextareaKey(markerId, index)
+    const editor = markerOptionValueRefs.current.get(key)
+    const markerSegment = descriptionContent.find(
+      (segment): segment is MarkerSegment =>
+        segment.type === 'marker' && segment.id === markerId,
+    )
+    const blockInfo = getMarkerBlockInfo(descriptionContent, markerId)
+    const option = markerSegment
+      ? getMarkerOptionState(markerSegment, blockInfo).options[index]
+      : null
+
+    if (!editor || !option) {
+      return false
+    }
+
+    const displaySelection = getSelectionOffsets(editor)
+    const displayText = editor.textContent ?? ''
+    const rememberedSelection = markerOptionSelectionRef.current
+    const selectionStart =
+      displaySelection?.start ?? rememberedSelection?.start ?? 0
+    const selectionEnd =
+      displaySelection?.end ?? rememberedSelection?.end ?? selectionStart
+    const selectedRange =
+      selectionStart !== selectionEnd
+        ? { start: selectionStart, end: selectionEnd }
+        : getWordRangeAtOffset(displayText, selectionStart)
+
+    if (!selectedRange) {
+      return false
+    }
+
+    const selectedText = displayText.slice(selectedRange.start, selectedRange.end)
+    const leadingSpace = selectedText.match(/^\s*/)?.[0].length ?? 0
+    const trailingSpace = selectedText.match(/\s*$/)?.[0].length ?? 0
+    const variantText = selectedText
+      .slice(leadingSpace, selectedText.length - trailingSpace)
+      .trim()
+
+    if (!variantText) {
+      return false
+    }
+
+    const displayVariantStart = selectedRange.start + leadingSpace
+    const displayVariantEnd = selectedRange.end - trailingSpace
+    const variantStart = getRawOffsetFromMarkerOptionDisplayOffset(
+      option.value,
+      displayVariantStart,
+    )
+    const variantEnd = getRawOffsetFromMarkerOptionDisplayOffset(
+      option.value,
+      displayVariantEnd,
+    )
+    const overlapsExistingVariant = getMarkerTemplateParts(option.value).some(
+      (part) =>
+        part.type === 'variant' &&
+        Math.max(part.rawStart, variantStart) < Math.min(part.rawEnd, variantEnd),
+    )
+
+    if (overlapsExistingVariant || variantEnd <= variantStart) {
+      return false
+    }
+
+    const replacement = `[[${variantText}]]`
+    const nextValue = `${option.value.slice(0, variantStart)}${replacement}${option.value.slice(
+      variantEnd,
+    )}`
+    const selectionOffset = displayVariantStart + variantText.length
+
+    changeMarkerOptionValue(markerId, index, nextValue)
+    setActiveVariant(null)
+    setActiveMarkerOptionVariant({
+      end: variantStart + replacement.length,
+      markerId,
+      optionIndex: index,
+      start: variantStart,
+    })
+    markerOptionSelectionRef.current = {
+      end: selectionOffset,
+      markerId,
+      optionIndex: index,
+      start: selectionOffset,
+      text: '',
+    }
+    window.requestAnimationFrame(() => {
+      const nextEditor = markerOptionValueRefs.current.get(key)
+
+      if (!nextEditor) {
+        return
+      }
+
+      nextEditor.focus()
+      restoreSelection(nextEditor, selectionOffset, selectionOffset)
+    })
+    return true
+  }
+
+  const createMarkerOptionVariantFromSelection = () => {
+    const markerOptionSelection = markerOptionSelectionRef.current
+
+    if (!markerOptionSelection) {
+      return false
+    }
+
+    const key = getMarkerOptionTextareaKey(
+      markerOptionSelection.markerId,
+      markerOptionSelection.optionIndex,
+    )
+    const editor = markerOptionValueRefs.current.get(key)
+
+    if (editor && document.activeElement === editor) {
+      rememberMarkerOptionSelection(
+        markerOptionSelection.markerId,
+        markerOptionSelection.optionIndex,
+        editor,
+      )
+    }
+
+    return wrapMarkerOptionSelectionAsVariant(
+      markerOptionSelection.markerId,
+      markerOptionSelection.optionIndex,
+    )
+  }
+
   const addMarkerOption = (markerId: number) => {
     updateMarkerOptions(markerId, (options) => [
       ...options,
-      createEmptyMarkerOption(),
+      createManualMarkerOption(),
     ])
   }
 
   const openMarkerDialog = (id: number) => {
+    ensureMarkerStandardOption(id)
     setActiveMarker({ id })
     setMarkerDialogId(id)
     setMarkerMenu(null)
     setMarkerContextMenu(null)
     setContextMenu(null)
     setActiveVariant(null)
+    setActiveMarkerOptionVariant(null)
   }
 
   const closeMarkerDialog = () => {
     setMarkerDialogId(null)
+    markerOptionSelectionRef.current = null
+    setActiveMarkerOptionVariant(null)
   }
 
   const deleteSectionMarker = (id: number) => {
@@ -5143,14 +6544,114 @@ function App() {
       return
     }
 
+    const blockInfo = getMarkerBlockInfo(descriptionContent, markerId)
+    const optionState = getMarkerOptionState(markerSegment, blockInfo)
+    const option = optionState.options[index]
+
+    if (!option) {
+      return
+    }
+
     replaceMarkerBlock(
       markerId,
-      markerSegment.options[index]?.value ?? '',
+      option.value,
       index,
+      optionState.options,
     )
     setActiveMarker({ id: markerId })
     setMarkerMenu(null)
     setMarkerContextMenu(null)
+  }
+
+  const updateSelectedMarkerOptionFromBlock = (markerId: number) => {
+    const content = getFreshContent('description')
+    const markerSegment = content.find(
+      (segment): segment is MarkerSegment =>
+        segment.type === 'marker' && segment.id === markerId,
+    )
+    const blockInfo = getMarkerBlockInfo(content, markerId)
+
+    if (!markerSegment || !blockInfo?.hasNextMarker) {
+      return
+    }
+
+    const optionState = getMarkerOptionState(markerSegment, blockInfo)
+    const selectedOptionIndex = getResolvedMarkerOptionIndex(
+      optionState,
+      blockInfo,
+    )
+
+    if (selectedOptionIndex === null) {
+      return
+    }
+
+    const nextOptions = optionState.options.map((option, optionIndex) =>
+      optionIndex === selectedOptionIndex
+        ? { ...option, value: blockInfo.value }
+        : option,
+    )
+    const nextContent = ensureLeadingMarkerContent(
+      content.map((segment) =>
+        segment.type === 'marker' && segment.id === markerId
+          ? {
+              ...segment,
+              options: nextOptions,
+              selectedOptionIndex,
+            }
+          : segment,
+      ),
+    )
+
+    setDescriptionContent(nextContent)
+    setActiveMarker({ id: markerId })
+    setMarkerContextMenu(null)
+  }
+
+  const saveMarkerBlockAsNewOption = (markerId: number) => {
+    const content = getFreshContent('description')
+    const markerSegment = content.find(
+      (segment): segment is MarkerSegment =>
+        segment.type === 'marker' && segment.id === markerId,
+    )
+    const blockInfo = getMarkerBlockInfo(content, markerId)
+
+    if (!markerSegment || !blockInfo?.hasNextMarker) {
+      return
+    }
+
+    const optionState = getMarkerOptionState(markerSegment, blockInfo)
+    const newOptionIndex = optionState.options.length
+    const nextOptions = [
+      ...optionState.options,
+      {
+        title: 'Новая заготовка',
+        value: blockInfo.value,
+      },
+    ]
+    const nextContent = ensureLeadingMarkerContent(
+      content.map((segment) =>
+        segment.type === 'marker' && segment.id === markerId
+          ? {
+              ...segment,
+              options: nextOptions,
+              selectedOptionIndex: newOptionIndex,
+            }
+          : segment,
+      ),
+    )
+
+    setDescriptionContent(nextContent)
+    setActiveMarker({ id: markerId })
+    setMarkerDialogId(markerId)
+    setPendingMarkerOptionTitleFocus({
+      markerId,
+      optionIndex: newOptionIndex,
+    })
+    setMarkerMenu(null)
+    setMarkerContextMenu(null)
+    setContextMenu(null)
+    setActiveVariant(null)
+    setActiveMarkerOptionVariant(null)
   }
 
   const saveProtocolTemplate = (nameValue = templateName, templateId?: string) => {
@@ -5211,8 +6712,11 @@ function App() {
       copyContent(template.conclusionContent),
     )
     const nextPassportData = options.resetPassport
-      ? createDefaultPassportData()
-      : copyPassportData(passportData)
+      ? createDefaultPassportData(passportCustomFieldDefinitions)
+      : applyPassportCustomFieldDefinitions(
+          passportData,
+          passportCustomFieldDefinitions,
+        )
     const nextSessionId =
       options.createSession || options.resetPassport || !activeProtocolSessionId
         ? createProtocolSessionId()
@@ -5309,26 +6813,8 @@ function App() {
     }
   }
 
-  const openProtocolDocumentUrl = (url: string) => {
-    const openedWindow = window.open(url, '_blank')
-
-    return Boolean(openedWindow)
-  }
-
-  const showProtocolSaveNotice = (
-    fileName: string,
-    message: string,
-    documentHtml: string,
-  ) => {
-    if (protocolOpenUrlRef.current) {
-      window.URL.revokeObjectURL(protocolOpenUrlRef.current)
-    }
-
-    const openUrl = window.URL.createObjectURL(createDocFileBlob(documentHtml))
-
-    protocolOpenUrlRef.current = openUrl
-    setProtocolSaveNotice({ fileName, message, openUrl })
-    openProtocolDocumentUrl(openUrl)
+  const showProtocolSaveNotice = (fileName: string, message: string) => {
+    setProtocolSaveNotice({ fileName, message })
   }
 
   const closeProtocolSaveNotice = () => {
@@ -5372,7 +6858,6 @@ function App() {
             result.directoryName
               ? `Сохранено в папку «${result.directoryName}».`
               : 'Сохранено в выбранную папку.',
-            protocolDocument,
           )
           return
         }
@@ -5393,7 +6878,6 @@ function App() {
     showProtocolSaveNotice(
       fileName,
       'Файл скачан обычным способом.',
-      protocolDocument,
     )
   }
 
@@ -5571,6 +7055,7 @@ function App() {
     )
 
     resetProtocolWorkspace()
+    setPassportCustomFieldDefinitions([])
     setTemplates(loadStoredTemplates(getProtocolTemplatesStorageKey(profile.id)))
     setSavedFindings(loadStoredFindings(getSavedFindingsStorageKey(profile.id)))
     setFindingFolders(
@@ -5591,6 +7076,7 @@ function App() {
   const signOutCurrentUser = () => {
     clearCurrentUserProfile()
     resetProtocolWorkspace()
+    setPassportCustomFieldDefinitions([])
     setTemplates([])
     setSavedFindings([])
     setFindingFolders([])
@@ -5676,6 +7162,109 @@ function App() {
   const closeProtocolExportSettings = () => {
     setIsProtocolExportSettingsOpen(false)
     setProtocolExportSettingsDraft(protocolExportSettings)
+  }
+
+  const changeProtocolDocumentFontFamily = (documentFontFamily: string) => {
+    setProtocolExportSettingsDraft((settings) => ({
+      ...settings,
+      documentFontFamily,
+    }))
+  }
+
+  const changeProtocolPageMargin = (
+    key: keyof ProtocolExportSettings['pageMargins'],
+    value: string,
+  ) => {
+    const margin = Number(value)
+
+    if (!Number.isFinite(margin)) {
+      return
+    }
+
+    setProtocolExportSettingsDraft((settings) => ({
+      ...settings,
+      pageMargins: {
+        ...settings.pageMargins,
+        [key]: margin,
+      },
+    }))
+  }
+
+  const updateProtocolSectionStyle = (
+    key: ProtocolSectionStyleKey,
+    updater: (style: ProtocolSectionStyle) => ProtocolSectionStyle,
+  ) => {
+    setProtocolExportSettingsDraft((settings) => ({
+      ...settings,
+      [key]: updater(settings[key]),
+    }))
+  }
+
+  const toggleProtocolSectionFormat = (
+    key: ProtocolSectionStyleKey,
+    formatKey: ProtocolSectionTextFormatKey,
+  ) => {
+    updateProtocolSectionStyle(key, (style) => ({
+      ...style,
+      [formatKey]: !style[formatKey],
+    }))
+  }
+
+  const changeProtocolSectionAlignment = (
+    key: ProtocolSectionStyleKey,
+    align: ProtocolHeaderAlignment,
+  ) => {
+    updateProtocolSectionStyle(key, (style) => ({
+      ...style,
+      align,
+    }))
+  }
+
+  const changeProtocolSectionFontSize = (
+    key: ProtocolSectionStyleKey,
+    value: string,
+  ) => {
+    const fontSize = Number(value)
+
+    if (!Number.isFinite(fontSize)) {
+      return
+    }
+
+    updateProtocolSectionStyle(key, (style) => ({
+      ...style,
+      fontSize,
+    }))
+  }
+
+  const toggleProtocolHeaderFormat = (
+    key: 'headerBold' | 'headerItalic' | 'headerUnderline',
+  ) => {
+    setProtocolExportSettingsDraft((settings) => ({
+      ...settings,
+      [key]: !settings[key],
+    }))
+  }
+
+  const changeProtocolHeaderAlignment = (
+    headerAlign: ProtocolHeaderAlignment,
+  ) => {
+    setProtocolExportSettingsDraft((settings) => ({
+      ...settings,
+      headerAlign,
+    }))
+  }
+
+  const changeProtocolHeaderFontSize = (value: string) => {
+    const headerFontSize = Number(value)
+
+    if (!Number.isFinite(headerFontSize)) {
+      return
+    }
+
+    setProtocolExportSettingsDraft((settings) => ({
+      ...settings,
+      headerFontSize,
+    }))
   }
 
   const saveProtocolExportSettings = () => {
@@ -6162,9 +7751,137 @@ function App() {
             </button>
           </div>
 
-          <label className="modal-field">
+          <div className="protocol-general-settings">
+            <label className="modal-field protocol-font-field">
+              <span>Шрифт протокола</span>
+              <select
+                onChange={(event) =>
+                  changeProtocolDocumentFontFamily(event.target.value)
+                }
+                value={protocolExportSettingsDraft.documentFontFamily}
+              >
+                {protocolDocumentFontOptions.map((fontFamily) => (
+                  <option key={fontFamily} value={fontFamily}>
+                    {fontFamily}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <div className="modal-field protocol-page-margins-field">
+              <span>Поля страницы, см</span>
+              <div className="protocol-page-margins-grid">
+                {protocolPageMarginFields.map((field) => (
+                  <label key={field.key}>
+                    <span>{field.label}</span>
+                    <input
+                      min="0"
+                      max="5"
+                      onChange={(event) =>
+                        changeProtocolPageMargin(field.key, event.target.value)
+                      }
+                      step="0.1"
+                      type="number"
+                      value={protocolExportSettingsDraft.pageMargins[field.key]}
+                    />
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="modal-field protocol-header-field">
             <span>Верхний колонтитул</span>
+            <div
+              aria-label="Форматирование верхнего колонтитула"
+              className="protocol-header-toolbar"
+            >
+              <div className="protocol-header-toolbar-group">
+                <button
+                  aria-pressed={protocolExportSettingsDraft.headerBold}
+                  className={
+                    protocolExportSettingsDraft.headerBold ? 'is-active' : ''
+                  }
+                  onClick={() => toggleProtocolHeaderFormat('headerBold')}
+                  title="Жирный"
+                  type="button"
+                >
+                  <strong>B</strong>
+                </button>
+                <button
+                  aria-pressed={protocolExportSettingsDraft.headerItalic}
+                  className={
+                    protocolExportSettingsDraft.headerItalic ? 'is-active' : ''
+                  }
+                  onClick={() => toggleProtocolHeaderFormat('headerItalic')}
+                  title="Курсив"
+                  type="button"
+                >
+                  <em>I</em>
+                </button>
+                <button
+                  aria-pressed={protocolExportSettingsDraft.headerUnderline}
+                  className={
+                    protocolExportSettingsDraft.headerUnderline
+                      ? 'is-active'
+                      : ''
+                  }
+                  onClick={() => toggleProtocolHeaderFormat('headerUnderline')}
+                  title="Подчеркивание"
+                  type="button"
+                >
+                  <u>U</u>
+                </button>
+              </div>
+
+              <label className="protocol-header-size-select">
+                <span>Размер</span>
+                <select
+                  aria-label="Размер шрифта"
+                  onChange={(event) =>
+                    changeProtocolHeaderFontSize(event.target.value)
+                  }
+                  value={protocolExportSettingsDraft.headerFontSize}
+                >
+                  {protocolHeaderFontSizes.map((size) => (
+                    <option key={size} value={size}>
+                      {size}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <div className="protocol-header-toolbar-group">
+                {protocolHeaderAlignments.map((alignment) => (
+                  <button
+                    aria-pressed={
+                      protocolExportSettingsDraft.headerAlign ===
+                      alignment.value
+                    }
+                    className={
+                      protocolExportSettingsDraft.headerAlign ===
+                      alignment.value
+                        ? 'is-active'
+                        : ''
+                    }
+                    key={alignment.value}
+                    onClick={() =>
+                      changeProtocolHeaderAlignment(alignment.value)
+                    }
+                    title={alignment.title}
+                    type="button"
+                  >
+                    <span
+                      aria-hidden="true"
+                      className={`protocol-align-icon is-${alignment.value}`}
+                    />
+                    <span className="sr-only">{alignment.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
             <textarea
+              className="protocol-header-textarea"
               onChange={(event) =>
                 setProtocolExportSettingsDraft((settings) => ({
                   ...settings,
@@ -6172,9 +7889,104 @@ function App() {
                 }))
               }
               placeholder="Текст шапки протокола"
+              style={protocolHeaderEditorStyle}
               value={protocolExportSettingsDraft.headerText}
             />
-          </label>
+          </div>
+
+          <div className="modal-field protocol-section-settings">
+            <span>Оформление разделов</span>
+            <div className="protocol-section-style-grid">
+              {protocolSectionStyleFields.map((section) => {
+                const style = protocolExportSettingsDraft[section.key]
+
+                return (
+                  <div className="protocol-section-style-card" key={section.key}>
+                    <strong>{section.label}</strong>
+                    <div className="protocol-section-style-controls">
+                      <button
+                        aria-pressed={style.bold}
+                        className={style.bold ? 'is-active' : ''}
+                        onClick={() =>
+                          toggleProtocolSectionFormat(section.key, 'bold')
+                        }
+                        title="Жирный"
+                        type="button"
+                      >
+                        <strong>B</strong>
+                      </button>
+                      <button
+                        aria-pressed={style.italic}
+                        className={style.italic ? 'is-active' : ''}
+                        onClick={() =>
+                          toggleProtocolSectionFormat(section.key, 'italic')
+                        }
+                        title="Курсив"
+                        type="button"
+                      >
+                        <em>I</em>
+                      </button>
+                      <button
+                        aria-pressed={style.underline}
+                        className={style.underline ? 'is-active' : ''}
+                        onClick={() =>
+                          toggleProtocolSectionFormat(section.key, 'underline')
+                        }
+                        title="Подчеркивание"
+                        type="button"
+                      >
+                        <u>U</u>
+                      </button>
+                      <label className="protocol-section-size-select">
+                        <span>Размер</span>
+                        <select
+                          aria-label={`Размер шрифта: ${section.label}`}
+                          onChange={(event) =>
+                            changeProtocolSectionFontSize(
+                              section.key,
+                              event.target.value,
+                            )
+                          }
+                          value={style.fontSize}
+                        >
+                          {protocolHeaderFontSizes.map((size) => (
+                            <option key={size} value={size}>
+                              {size}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <div className="protocol-section-align-group">
+                        {protocolHeaderAlignments.map((alignment) => (
+                          <button
+                            aria-pressed={style.align === alignment.value}
+                            className={
+                              style.align === alignment.value ? 'is-active' : ''
+                            }
+                            key={alignment.value}
+                            onClick={() =>
+                              changeProtocolSectionAlignment(
+                                section.key,
+                                alignment.value,
+                              )
+                            }
+                            title={`${section.label}: ${alignment.title}`}
+                            type="button"
+                          >
+                            <span
+                              aria-hidden="true"
+                              className={`protocol-align-icon is-${alignment.value}`}
+                            />
+                            <span className="sr-only">{alignment.label}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
 
           <div className="protocol-export-settings-grid">
             <label className="modal-field">
@@ -6309,14 +8121,12 @@ function App() {
 
   const renderMarkerSettingsDialog = () =>
     markerDialogId !== null && markerDialogSegment && markerDialogBlock ? (
-      <div className="modal-backdrop" onMouseDown={closeMarkerDialog}>
-        <section
-          aria-labelledby="marker-settings-title"
-          aria-modal="true"
-          className="modal-panel marker-settings-modal"
-          onMouseDown={(event) => event.stopPropagation()}
-          role="dialog"
-        >
+      <section
+        aria-labelledby="marker-settings-title"
+        className="modal-panel marker-settings-modal marker-settings-floating"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+      >
           <div className="modal-header">
             <h2 id="marker-settings-title">Раздел</h2>
             <button
@@ -6342,44 +8152,149 @@ function App() {
             />
           </label>
 
-          <div className="marker-option-list">
-            {(markerDialogSegment.options.length
-              ? markerDialogSegment.options
-              : [createEmptyMarkerOption()]
-            ).map((option, index) => (
+          {shouldShowMarkerBoundaryReminder ? (
+            <div className="marker-boundary-reminder" role="note">
+              {markerBoundaryReminderText}
+            </div>
+          ) : (
+            <div className="marker-option-list">
+              {markerDialogOptions.map((option, index) => (
               <div className="marker-option-row" key={index}>
                 <div className="marker-option-fields">
-                  <input
-                    aria-label={`Название заготовки ${index + 1}`}
-                    onChange={(event) =>
-                      changeMarkerOptionTitle(
-                        markerDialogSegment.id,
-                        index,
-                        event.target.value,
-                      )
-                    }
-                    placeholder="Название"
-                    type="text"
-                    value={option.title}
-                  />
-                  <textarea
-                    aria-label={`Текст заготовки ${index + 1}`}
-                    onChange={(event) =>
-                      changeMarkerOptionValue(
-                        markerDialogSegment.id,
-                        index,
-                        event.target.value,
-                      )
-                    }
-                    placeholder="Заготовка"
-                    value={option.value}
-                  />
+                  <div className="marker-option-title-wrap">
+                    <input
+                      aria-label={`Название заготовки ${index + 1}`}
+                      onChange={(event) =>
+                        changeMarkerOptionTitle(
+                          markerDialogSegment.id,
+                          index,
+                          event.target.value,
+                        )
+                      }
+                      placeholder="Название"
+                      ref={(element) => {
+                        const key = getMarkerOptionTextareaKey(
+                          markerDialogSegment.id,
+                          index,
+                        )
+
+                        if (element) {
+                          markerOptionTitleRefs.current.set(key, element)
+                        } else {
+                          markerOptionTitleRefs.current.delete(key)
+                        }
+                      }}
+                      type="text"
+                      value={option.title}
+                    />
+                    <button
+                      aria-label={`Удалить заготовку ${index + 1}`}
+                      className="marker-option-delete-button"
+                      disabled={!canDeleteMarkerOption(option, markerDialogBlock)}
+                      onClick={() =>
+                        deleteMarkerOption(markerDialogSegment.id, index)
+                      }
+                      title={
+                        canDeleteMarkerOption(option, markerDialogBlock)
+                          ? 'Удалить заготовку'
+                          : 'Стандартная заготовка создается автоматически'
+                      }
+                      type="button"
+                    >
+                      x
+                    </button>
+                  </div>
+                  <div className="marker-option-textarea-wrap">
+                    <div
+                      aria-label={`Текст заготовки ${index + 1}`}
+                      aria-multiline="true"
+                      className="marker-option-editor"
+                      contentEditable
+                      data-empty={option.value.trim() ? undefined : 'true'}
+                      data-placeholder="Заготовка"
+                      dangerouslySetInnerHTML={{
+                        __html: markerOptionValueToHtml(option.value),
+                      }}
+                      onClick={(event) => {
+                        const token = (
+                          event.target as HTMLElement | null
+                        )?.closest<HTMLElement>('.marker-option-variant-token')
+                        const rawStart = Number(token?.dataset.rawStart)
+                        const rawEnd = Number(token?.dataset.rawEnd)
+
+                        if (
+                          token &&
+                          event.currentTarget.contains(token) &&
+                          Number.isFinite(rawStart) &&
+                          Number.isFinite(rawEnd)
+                        ) {
+                          setActiveVariant(null)
+                          setActiveMarkerOptionVariant({
+                            end: rawEnd,
+                            markerId: markerDialogSegment.id,
+                            optionIndex: index,
+                            start: rawStart,
+                          })
+                        }
+                      }}
+                      onFocus={(event) =>
+                        rememberMarkerOptionSelection(
+                          markerDialogSegment.id,
+                          index,
+                          event.currentTarget,
+                        )
+                      }
+                      onInput={(event) =>
+                        handleMarkerOptionValueInput(
+                          markerDialogSegment.id,
+                          index,
+                          event.currentTarget,
+                        )
+                      }
+                      onKeyUp={(event) =>
+                        rememberMarkerOptionSelection(
+                          markerDialogSegment.id,
+                          index,
+                          event.currentTarget,
+                        )
+                      }
+                      onMouseUp={(event) =>
+                        rememberMarkerOptionSelection(
+                          markerDialogSegment.id,
+                          index,
+                          event.currentTarget,
+                        )
+                      }
+                      onPaste={(event: ClipboardEvent<HTMLDivElement>) => {
+                        event.preventDefault()
+                        document.execCommand(
+                          'insertText',
+                          false,
+                          event.clipboardData.getData('text/plain'),
+                        )
+                      }}
+                      ref={(element) => {
+                        const key = getMarkerOptionTextareaKey(
+                          markerDialogSegment.id,
+                          index,
+                        )
+
+                        if (element) {
+                          markerOptionValueRefs.current.set(key, element)
+                        } else {
+                          markerOptionValueRefs.current.delete(key)
+                        }
+                      }}
+                      role="textbox"
+                      spellCheck
+                      suppressContentEditableWarning
+                    />
+                  </div>
                 </div>
                 <label className="variant-check marker-option-check">
                   <input
                     checked={
-                      markerDialogSegment.selectedOptionIndex === index &&
-                      markerDialogBlock.value === option.value
+                      markerDialogOptionState.selectedOptionIndex === index
                     }
                     onChange={() =>
                       applyMarkerOption(markerDialogSegment.id, index)
@@ -6389,8 +8304,9 @@ function App() {
                   <span>✓</span>
                 </label>
               </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
 
           <button
             aria-label="Добавить заготовку"
@@ -6400,8 +8316,7 @@ function App() {
           >
             +
           </button>
-        </section>
-      </div>
+      </section>
     ) : null
 
   const renderPassportSettingsDialog = () =>
@@ -6463,8 +8378,8 @@ function App() {
             <span className="passport-settings-section-title">
               Дополнительные поля
             </span>
-            {passportData.customFields.length > 0 ? (
-              passportData.customFields.map((field) => (
+            {passportCustomFieldDefinitions.length > 0 ? (
+              passportCustomFieldDefinitions.map((field) => (
                 <div className="passport-settings-field-item" key={field.id}>
                   <span>{field.label.trim() || 'Поле'}</span>
                   <button
@@ -6726,19 +8641,6 @@ function App() {
                 <span
                   aria-hidden="true"
                   className="field-tool-icon search-icon"
-                />
-              </button>
-              <button
-                aria-label="Копировать в заключение"
-                className="field-tool-button"
-                onClick={copySelectionToConclusion}
-                onMouseDown={(event) => event.preventDefault()}
-                title="Копировать в заключение"
-                type="button"
-              >
-                <span
-                  aria-hidden="true"
-                  className="field-tool-icon copy-to-conclusion-icon"
                 />
               </button>
               <button
@@ -7088,6 +8990,15 @@ function App() {
                       aria-label={`Находка ${index + 1}`}
                       className="finding-summary-content"
                       onClick={() => activateFindingCapsule(range)}
+                      title={[
+                        descriptionValue,
+                        conclusionValue,
+                        lateralityWarning
+                          ? `Проверьте сторону: ${lateralityWarning}`
+                          : '',
+                      ]
+                        .filter(Boolean)
+                        .join('\n')}
                       type="button"
                     >
                       <span className="finding-summary-number">
@@ -7104,7 +9015,15 @@ function App() {
                         )}
                         {lateralityWarning && (
                           <span className="finding-summary-warning">
-                            Проверьте сторону: {lateralityWarning}
+                            <span
+                              aria-hidden="true"
+                              className="finding-summary-warning-icon"
+                            >
+                              !
+                            </span>
+                            <span className="finding-summary-warning-text">
+                              Проверьте сторону: {lateralityWarning}
+                            </span>
                           </span>
                         )}
                       </span>
@@ -7125,12 +9044,14 @@ function App() {
 
       </aside>
 
-      {activeVariant && activeVariantSegment && (
+      {visibleVariantSegment && (
         <VariantPopover
           onAddOption={addVariantOption}
           onChangeOption={changeVariantOption}
+          onDeleteOption={deleteVariantOption}
           onSelectOption={chooseVariantOption}
-          variant={activeVariantSegment}
+          panelWidth={sidePanelWidth}
+          variant={visibleVariantSegment}
         />
       )}
 
@@ -7140,19 +9061,22 @@ function App() {
           onMouseDown={(event) => event.stopPropagation()}
           style={{ left: markerMenu.x, top: markerMenu.y }}
         >
-          {(markerMenuSegment.options.length
-            ? markerMenuSegment.options
-            : [createEmptyMarkerOption()]
-          ).map((option, index) => (
-            <button
-              key={index}
-              onClick={() => applyMarkerOption(markerMenu.id, index)}
-              title={option.value}
-              type="button"
-            >
-              {getMarkerOptionLabel(option, index)}
-            </button>
-          ))}
+          {markerMenuOptions.length ? (
+            markerMenuOptions.map((option, index) => (
+              <button
+                key={index}
+                onClick={() => applyMarkerOption(markerMenu.id, index)}
+                title={option.value}
+                type="button"
+              >
+                {getMarkerOptionLabel(option, index)}
+              </button>
+            ))
+          ) : (
+            <span className="marker-context-note">
+              {markerBoundaryReminderText}
+            </span>
+          )}
         </div>
       )}
 
@@ -7162,6 +9086,41 @@ function App() {
           onMouseDown={(event) => event.stopPropagation()}
           style={{ left: markerContextMenu.x, top: markerContextMenu.y }}
         >
+          <div className="marker-action-selected-option">
+            <span>Выбрано</span>
+            <strong>{markerContextMenuSelectedOptionLabel}</strong>
+          </div>
+          <button
+            disabled={
+              !markerContextMenuBlock?.hasNextMarker ||
+              markerContextMenuSelectedOptionIndex === null
+            }
+            onClick={() =>
+              updateSelectedMarkerOptionFromBlock(markerContextMenu.id)
+            }
+            title={
+              markerContextMenuSelectedOptionIndex === null
+                ? 'Сначала выберите заготовку'
+                : !markerContextMenuBlock?.hasNextMarker
+                  ? 'Добавьте следующую метку, чтобы указать границы раздела'
+                  : 'Перезаписать выбранную заготовку текущим текстом раздела'
+            }
+            type="button"
+          >
+            Обновить
+          </button>
+          <button
+            disabled={!markerContextMenuBlock?.hasNextMarker}
+            onClick={() => saveMarkerBlockAsNewOption(markerContextMenu.id)}
+            title={
+              markerContextMenuBlock?.hasNextMarker
+                ? 'Создать новую заготовку из текущего текста раздела'
+                : 'Добавьте следующую метку, чтобы указать границы раздела'
+            }
+            type="button"
+          >
+            Сохранить как новый
+          </button>
           <button
             onClick={() => openMarkerDialog(markerContextMenu.id)}
             type="button"
@@ -7243,6 +9202,24 @@ function App() {
                 value={findingSaveDialog.name}
               />
             </label>
+            <div
+              aria-label="Предпросмотр сохраняемой находки"
+              className="finding-save-preview"
+            >
+              <div className="finding-save-preview-block">
+                <strong>Описание</strong>
+                <p>
+                  {findingSaveDialog.description.trim() || 'Описание пустое'}
+                </p>
+              </div>
+              <div className="finding-save-preview-block">
+                <strong>Заключение</strong>
+                <p>
+                  {findingSaveDialog.conclusion.trim() ||
+                    'Заключение не добавлено'}
+                </p>
+              </div>
+            </div>
             <div className="modal-actions">
               <button
                 disabled={
@@ -7350,12 +9327,6 @@ function App() {
             <span>{protocolSaveNotice.message}</span>
             <small>{protocolSaveNotice.fileName}</small>
           </div>
-          <button
-            onClick={() => openProtocolDocumentUrl(protocolSaveNotice.openUrl)}
-            type="button"
-          >
-            Открыть
-          </button>
           <button
             aria-label="Закрыть уведомление"
             className="protocol-save-toast-close"
