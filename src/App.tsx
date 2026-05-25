@@ -83,6 +83,7 @@ import {
 } from './utils/passport'
 import {
   buildProtocolFileNameTemplate,
+  createDocFileBlob,
   createDefaultProtocolExportSettings,
   createProtocolDownloadDocument,
   downloadDocFile,
@@ -2256,6 +2257,12 @@ const createEmptyStartTemplateDraft = () => ({
   name: '',
 })
 
+type ProtocolSaveNotice = {
+  fileName: string
+  message: string
+  openUrl: string
+}
+
 function App() {
   const workspaceRef = useRef<HTMLElement>(null)
   const descriptionRef = useRef<HTMLDivElement>(null)
@@ -2263,6 +2270,7 @@ function App() {
   const pendingSelectionRef = useRef<PendingSelection | null>(null)
   const lastActiveEditorRef = useRef<FieldName | null>(null)
   const lastDescriptionSelectionRef = useRef<PendingSelection | null>(null)
+  const protocolOpenUrlRef = useRef<string | null>(null)
   const activeIncompleteFindingRef = useRef<{
     field: FieldName
     range: TextRange
@@ -2360,6 +2368,8 @@ function App() {
     string | null
   >(null)
   const [protocolDirectoryStatus, setProtocolDirectoryStatus] = useState('')
+  const [protocolSaveNotice, setProtocolSaveNotice] =
+    useState<ProtocolSaveNotice | null>(null)
   const [findingSearchQuery, setFindingSearchQuery] = useState('')
   const [findingSearchWarning, setFindingSearchWarning] = useState('')
   const [findingBrowserWarning, setFindingBrowserWarning] = useState('')
@@ -2740,6 +2750,27 @@ function App() {
       isMounted = false
     }
   }, [isProtocolDirectorySaveAvailable])
+
+  useEffect(
+    () => () => {
+      if (protocolOpenUrlRef.current) {
+        window.URL.revokeObjectURL(protocolOpenUrlRef.current)
+      }
+    },
+    [],
+  )
+
+  useEffect(() => {
+    if (!protocolSaveNotice) {
+      return
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setProtocolSaveNotice(null)
+    }, 9000)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [protocolSaveNotice])
 
   useEffect(() => {
     if (!currentUser || storageUserId !== currentUser.id) {
@@ -5278,6 +5309,32 @@ function App() {
     }
   }
 
+  const openProtocolDocumentUrl = (url: string) => {
+    const openedWindow = window.open(url, '_blank')
+
+    return Boolean(openedWindow)
+  }
+
+  const showProtocolSaveNotice = (
+    fileName: string,
+    message: string,
+    documentHtml: string,
+  ) => {
+    if (protocolOpenUrlRef.current) {
+      window.URL.revokeObjectURL(protocolOpenUrlRef.current)
+    }
+
+    const openUrl = window.URL.createObjectURL(createDocFileBlob(documentHtml))
+
+    protocolOpenUrlRef.current = openUrl
+    setProtocolSaveNotice({ fileName, message, openUrl })
+    openProtocolDocumentUrl(openUrl)
+  }
+
+  const closeProtocolSaveNotice = () => {
+    setProtocolSaveNotice(null)
+  }
+
   const downloadProtocol = async () => {
     const freshDescriptionContent = getFreshContent('description')
     const freshConclusionContent = getFreshContent('conclusion')
@@ -5310,6 +5367,13 @@ function App() {
               ? `Сохранено в папку «${result.directoryName}».`
               : 'Сохранено в выбранную папку.',
           )
+          showProtocolSaveNotice(
+            fileName,
+            result.directoryName
+              ? `Сохранено в папку «${result.directoryName}».`
+              : 'Сохранено в выбранную папку.',
+            protocolDocument,
+          )
           return
         }
 
@@ -5326,6 +5390,11 @@ function App() {
     }
 
     downloadDocFile(fileName, protocolDocument)
+    showProtocolSaveNotice(
+      fileName,
+      'Файл скачан обычным способом.',
+      protocolDocument,
+    )
   }
 
   const closeStartCreateDialog = () => {
@@ -7271,6 +7340,30 @@ function App() {
               )}
             </div>
           </section>
+        </div>
+      )}
+
+      {protocolSaveNotice && (
+        <div className="protocol-save-toast" role="status" aria-live="polite">
+          <div className="protocol-save-toast-body">
+            <strong>Протокол сохранен</strong>
+            <span>{protocolSaveNotice.message}</span>
+            <small>{protocolSaveNotice.fileName}</small>
+          </div>
+          <button
+            onClick={() => openProtocolDocumentUrl(protocolSaveNotice.openUrl)}
+            type="button"
+          >
+            Открыть
+          </button>
+          <button
+            aria-label="Закрыть уведомление"
+            className="protocol-save-toast-close"
+            onClick={closeProtocolSaveNotice}
+            type="button"
+          >
+            x
+          </button>
         </div>
       )}
 
