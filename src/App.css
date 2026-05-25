@@ -1702,6 +1702,26 @@ button:focus-visible {
   line-height: 1;
 }
 
+.protocol-save-folder-field {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.protocol-save-folder-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.protocol-save-folder-status {
+  margin: -2px 0 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .browser-toolbar {
   display: flex;
   justify-content: flex-start;

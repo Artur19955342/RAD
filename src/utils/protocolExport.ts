@@ -332,10 +332,13 @@ export const formatProtocolFileName = (
   return sanitizeDownloadFileName(rawName)
 }
 
-export const downloadDocFile = (fileName: string, documentHtml: string) => {
-  const blob = new Blob(['\ufeff', documentHtml], {
+export const createDocFileBlob = (documentHtml: string) =>
+  new Blob(['\ufeff', documentHtml], {
     type: 'application/msword;charset=utf-8',
   })
+
+export const downloadDocFile = (fileName: string, documentHtml: string) => {
+  const blob = createDocFileBlob(documentHtml)
   const url = window.URL.createObjectURL(blob)
   const link = document.createElement('a')
 

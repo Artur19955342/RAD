@@ -64,6 +64,13 @@ import {
   storeFindingFolders,
   storeSavedFindings,
 } from './utils/findingMemory'
+import {
+  chooseProtocolDirectory,
+  clearStoredProtocolDirectory,
+  getStoredProtocolDirectory,
+  isProtocolDirectorySaveSupported,
+  saveDocFileToStoredProtocolDirectory,
+} from './utils/deviceFileSave'
 import { escapeHtml } from './utils/html'
 import { getLateralityWarning } from './utils/lateralityCheck'
 import {
@@ -2346,6 +2353,13 @@ function App() {
   const [conclusionPanelHeight, setConclusionPanelHeight] = useState(
     defaultConclusionPanelHeight,
   )
+  const [isProtocolDirectorySaveAvailable] = useState(() =>
+    isProtocolDirectorySaveSupported(),
+  )
+  const [protocolDirectoryName, setProtocolDirectoryName] = useState<
+    string | null
+  >(null)
+  const [protocolDirectoryStatus, setProtocolDirectoryStatus] = useState('')
   const [findingSearchQuery, setFindingSearchQuery] = useState('')
   const [findingSearchWarning, setFindingSearchWarning] = useState('')
   const [findingBrowserWarning, setFindingBrowserWarning] = useState('')
@@ -2708,6 +2722,24 @@ function App() {
     conclusionContent,
     highlightedPair,
   ])
+
+  useEffect(() => {
+    let isMounted = true
+
+    if (!isProtocolDirectorySaveAvailable) {
+      return
+    }
+
+    void getStoredProtocolDirectory().then((directory) => {
+      if (isMounted) {
+        setProtocolDirectoryName(directory?.name ?? null)
+      }
+    })
+
+    return () => {
+      isMounted = false
+    }
+  }, [isProtocolDirectorySaveAvailable])
 
   useEffect(() => {
     if (!currentUser || storageUserId !== currentUser.id) {
@@ -5246,7 +5278,7 @@ function App() {
     }
   }
 
-  const downloadProtocol = () => {
+  const downloadProtocol = async () => {
     const freshDescriptionContent = getFreshContent('description')
     const freshConclusionContent = getFreshContent('conclusion')
     const protocolDocument = createProtocolDownloadDocument(
@@ -5262,8 +5294,38 @@ function App() {
       templateName.trim() || 'Протокол',
       protocolExportSettings.footerDoctorName,
     )
+    const fileName = `${fileNameBase}.doc`
 
-    downloadDocFile(`${fileNameBase}.doc`, protocolDocument)
+    if (isProtocolDirectorySaveAvailable && protocolDirectoryName) {
+      try {
+        const result = await saveDocFileToStoredProtocolDirectory(
+          fileName,
+          protocolDocument,
+        )
+
+        if (result.saved) {
+          setProtocolDirectoryName(result.directoryName)
+          setProtocolDirectoryStatus(
+            result.directoryName
+              ? `Сохранено в папку «${result.directoryName}».`
+              : 'Сохранено в выбранную папку.',
+          )
+          return
+        }
+
+        setProtocolDirectoryStatus(
+          result.directoryName
+            ? `Нет доступа к папке «${result.directoryName}», файл скачан обычным способом.`
+            : 'Папка не выбрана, файл скачан обычным способом.',
+        )
+      } catch {
+        setProtocolDirectoryStatus(
+          'Не удалось сохранить в выбранную папку, файл скачан обычным способом.',
+        )
+      }
+    }
+
+    downloadDocFile(fileName, protocolDocument)
   }
 
   const closeStartCreateDialog = () => {
@@ -5494,6 +5556,38 @@ function App() {
     setProtocolExportSettingsDraft(protocolExportSettings)
     setIsProtocolExportSettingsOpen(true)
     setIsAppMenuOpen(false)
+  }
+
+  const chooseProtocolDownloadDirectory = async () => {
+    if (!isProtocolDirectorySaveAvailable) {
+      setProtocolDirectoryStatus(
+        'Выбор папки поддерживается в Chrome и Edge. Сейчас файл будет скачиваться обычным способом.',
+      )
+      return
+    }
+
+    try {
+      const directory = await chooseProtocolDirectory()
+
+      if (directory) {
+        setProtocolDirectoryName(directory.name)
+        setProtocolDirectoryStatus(
+          `Папка для этого устройства: «${directory.name}».`,
+        )
+      }
+    } catch (error) {
+      if ((error as DOMException).name !== 'AbortError') {
+        setProtocolDirectoryStatus(
+          'Не удалось сохранить выбранную папку. Можно продолжить обычное скачивание.',
+        )
+      }
+    }
+  }
+
+  const resetProtocolDownloadDirectory = async () => {
+    await clearStoredProtocolDirectory()
+    setProtocolDirectoryName(null)
+    setProtocolDirectoryStatus('Папка сброшена. Файл будет скачиваться обычным способом.')
   }
 
   const openPassportSettings = () => {
@@ -6104,6 +6198,37 @@ function App() {
             )}
           </div>
 
+          <div className="modal-field protocol-save-folder-field">
+            <span>Папка сохранения на этом устройстве</span>
+            <div className="protocol-save-folder-row">
+              <button
+                onClick={() => void chooseProtocolDownloadDirectory()}
+                type="button"
+              >
+                Выбрать папку
+              </button>
+              <button
+                disabled={!protocolDirectoryName}
+                onClick={() => void resetProtocolDownloadDirectory()}
+                type="button"
+              >
+                Сбросить
+              </button>
+            </div>
+            <p className="protocol-export-settings-hint">
+              {isProtocolDirectorySaveAvailable
+                ? protocolDirectoryName
+                  ? `Выбрана папка «${protocolDirectoryName}». Настройка хранится только в этом браузере и на этом устройстве.`
+                  : 'Папка не выбрана. Пока протокол скачивается обычным способом.'
+                : 'Браузер не поддерживает выбор папки. Будет использоваться обычное скачивание.'}
+            </p>
+            {protocolDirectoryStatus && (
+              <p className="protocol-save-folder-status">
+                {protocolDirectoryStatus}
+              </p>
+            )}
+          </div>
+
           <div className="modal-actions">
             <button onClick={saveProtocolExportSettings} type="button">
               Сохранить
@@ -6681,7 +6806,7 @@ function App() {
             <button
               aria-label="Скачать протокол"
               className="template-open-button"
-              onClick={downloadProtocol}
+              onClick={() => void downloadProtocol()}
               title="Скачать протокол"
               type="button"
             >
