@@ -1,5 +1,11 @@
 import type { DragEvent } from 'react'
-import type { BrowserDragItem, FindingFolder, SavedFinding } from '../types'
+import type {
+  BrowserDragItem,
+  EditorSegment,
+  FindingFolder,
+  MarkerOption,
+  SavedFinding,
+} from '../types'
 
 export const savedFindingsStorageKey = 'radiology-app-saved-findings-v1'
 export const findingFoldersStorageKey = 'radiology-app-finding-folders-v1'
@@ -41,12 +47,131 @@ export const findSavedFindingMatch = (
   )
 }
 
-export const sanitizeStoredFinding = (value: unknown): SavedFinding | null => {
-  if (!value || typeof value !== 'object') {
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === 'object'
+
+const createFallbackSegmentId = () =>
+  Math.floor(getTimestamp() + Math.random() * 1_000_000)
+
+const sanitizeSegmentId = (value: unknown) =>
+  typeof value === 'number' && Number.isFinite(value)
+    ? value
+    : createFallbackSegmentId()
+
+const sanitizeMarkerOptions = (value: unknown): MarkerOption[] =>
+  Array.isArray(value)
+    ? value.flatMap((option) => {
+        if (!isRecord(option)) {
+          return []
+        }
+
+        return [
+          {
+            findingIds: Array.isArray(option.findingIds)
+              ? option.findingIds.filter(
+                  (findingId): findingId is string =>
+                    typeof findingId === 'string',
+                )
+              : [],
+            title: typeof option.title === 'string' ? option.title : '',
+            value: typeof option.value === 'string' ? option.value : '',
+          },
+        ]
+      })
+    : []
+
+const sanitizeStoredEditorSegment = (
+  value: unknown,
+): EditorSegment | null => {
+  if (!isRecord(value) || typeof value.type !== 'string') {
     return null
   }
 
-  const finding = value as Partial<SavedFinding>
+  if (value.type === 'text') {
+    return typeof value.text === 'string'
+      ? {
+          id: sanitizeSegmentId(value.id),
+          text: value.text,
+          type: 'text',
+        }
+      : null
+  }
+
+  if (value.type === 'variant') {
+    if (typeof value.value !== 'string') {
+      return null
+    }
+
+    return {
+      id: sanitizeSegmentId(value.id),
+      options: Array.isArray(value.options)
+        ? value.options.filter(
+            (option): option is string => typeof option === 'string',
+          )
+        : [value.value],
+      type: 'variant',
+      value: value.value,
+    }
+  }
+
+  if (value.type === 'number') {
+    return typeof value.value === 'string'
+      ? {
+          id: sanitizeSegmentId(value.id),
+          type: 'number',
+          value: value.value,
+        }
+      : null
+  }
+
+  if (value.type === 'marker') {
+    const options = sanitizeMarkerOptions(value.options)
+
+    return {
+      defaultOptionIndex:
+        typeof value.defaultOptionIndex === 'number' &&
+        Number.isInteger(value.defaultOptionIndex) &&
+        value.defaultOptionIndex >= 0 &&
+        value.defaultOptionIndex < options.length
+          ? value.defaultOptionIndex
+          : null,
+      id: sanitizeSegmentId(value.id),
+      options,
+      selectedOptionIndex:
+        typeof value.selectedOptionIndex === 'number' &&
+        Number.isInteger(value.selectedOptionIndex) &&
+        value.selectedOptionIndex >= 0 &&
+        value.selectedOptionIndex < options.length
+          ? value.selectedOptionIndex
+          : null,
+      title: typeof value.title === 'string' ? value.title : '',
+      type: 'marker',
+    }
+  }
+
+  return null
+}
+
+const sanitizeStoredEditorContent = (value: unknown) => {
+  if (!Array.isArray(value)) {
+    return undefined
+  }
+
+  const content = value.flatMap((segment) => {
+    const sanitizedSegment = sanitizeStoredEditorSegment(segment)
+
+    return sanitizedSegment ? [sanitizedSegment] : []
+  })
+
+  return content.length ? content : undefined
+}
+
+export const sanitizeStoredFinding = (value: unknown): SavedFinding | null => {
+  if (!isRecord(value)) {
+    return null
+  }
+
+  const finding = value
 
   if (
     typeof finding.id !== 'string' ||
@@ -63,7 +188,9 @@ export const sanitizeStoredFinding = (value: unknown): SavedFinding | null => {
     id: finding.id,
     name: finding.name,
     description: finding.description,
+    descriptionContent: sanitizeStoredEditorContent(finding.descriptionContent),
     conclusion: finding.conclusion,
+    conclusionContent: sanitizeStoredEditorContent(finding.conclusionContent),
     folderId: typeof finding.folderId === 'string' ? finding.folderId : null,
     createdAt: typeof finding.createdAt === 'number' ? finding.createdAt : now,
     updatedAt: typeof finding.updatedAt === 'number' ? finding.updatedAt : now,
@@ -71,11 +198,11 @@ export const sanitizeStoredFinding = (value: unknown): SavedFinding | null => {
 }
 
 export const sanitizeStoredFolder = (value: unknown): FindingFolder | null => {
-  if (!value || typeof value !== 'object') {
+  if (!isRecord(value)) {
     return null
   }
 
-  const folder = value as Partial<FindingFolder>
+  const folder = value
 
   if (typeof folder.id !== 'string' || typeof folder.name !== 'string') {
     return null

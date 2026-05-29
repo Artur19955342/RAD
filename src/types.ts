@@ -27,11 +27,13 @@ export type NumericSegment = {
 }
 
 export type MarkerOption = {
+  findingIds: string[]
   title: string
   value: string
 }
 
 export type MarkerSegment = {
+  defaultOptionIndex: number | null
   id: number
   type: 'marker'
   title: string
@@ -88,6 +90,7 @@ export type FindingPair = {
   id: number
   description: TextRange
   conclusion: TextRange
+  savedFindingId?: string | null
 }
 
 export type PendingSelection = TextRange & {
@@ -111,7 +114,9 @@ export type SavedFinding = {
   id: string
   name: string
   description: string
+  descriptionContent?: EditorSegment[]
   conclusion: string
+  conclusionContent?: EditorSegment[]
   folderId: string | null
   createdAt: number
   updatedAt: number
@@ -127,9 +132,13 @@ export type FindingFolder = {
 
 export type FindingSaveDialog = {
   existingId: string | null
+  descriptionRange: TextRange
+  pairId: number | null
   name: string
   description: string
+  descriptionContent: EditorSegment[]
   conclusion: string
+  conclusionContent: EditorSegment[]
 }
 
 export type PatientSex = '' | 'male' | 'female'

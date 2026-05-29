@@ -15,6 +15,15 @@ import {
 } from 'react'
 import './App.css'
 import EditableArea from './components/EditableArea'
+import ProtocolDownloadSaveDialogPanel, {
+  type ProtocolDownloadFindingSaveItem,
+  type ProtocolDownloadSaveDialogState,
+  type ProtocolDownloadSaveItem,
+  type ProtocolDownloadSectionCurrentSaveItem,
+  type ProtocolDownloadSectionOptionSaveItem,
+  type ProtocolDownloadSectionSaveMode,
+  type ProtocolDownloadSectionStructureSaveItem,
+} from './components/ProtocolDownloadSaveDialog'
 import ProtocolTemplatesDialog from './components/ProtocolTemplatesDialog'
 import VariantPopover from './components/VariantPopover'
 import { useEvent } from './hooks/useEvent'
@@ -67,6 +76,13 @@ import {
   storeSavedFindings,
 } from './utils/findingMemory'
 import {
+  findingFolderCreateSelectPrefix,
+  findingFolderRootSelectValue,
+  findingFolderSelectPrefix,
+  getRootFindingFolderByName,
+  normalizeFindingFolderName,
+} from './utils/findingFolders'
+import {
   chooseProtocolDirectory,
   clearStoredProtocolDirectory,
   getStoredProtocolDirectory,
@@ -108,6 +124,30 @@ import {
   type UserDataSnapshot,
 } from './utils/userDataStorage'
 import {
+  adjustTrackedRangesForEdit,
+  adjustTrackedRangesForReplacement,
+  clampTextRange,
+  createCollapsedTextRange,
+  doesTextChangeTouchRange,
+  getAnchoredInsertionTextChange,
+  getRangeOverlap,
+  getTextChange,
+  getTextChangeDelta,
+  getTextChangeFromEdit,
+  isOffsetInRange,
+  isSameRange,
+  mapRangeThroughTextChange,
+  mergeTextRanges,
+  trackTextChangeRange,
+} from './utils/textRanges'
+import {
+  createMarkerOptionVariantToken,
+  getMarkerOptionComparableValue,
+  getMarkerTemplateParts,
+  hasMarkerOptionVariantChange,
+  parseMarkerOptionVariantToken,
+} from './utils/markerOptions'
+import {
   clearCurrentUserProfile,
   createUserProfile,
   getUserStorageKey,
@@ -135,7 +175,8 @@ const defaultConclusionPanelHeight = 280
 const minDescriptionPanelHeight = 220
 const minConclusionPanelHeight = 160
 const resizeHandleSize = 6
-const sentenceTerminalPattern = /(?:\.{1,}|\u2026)\s*$/
+const semanticBlockOpen = '{'
+const semanticBlockClose = '}'
 const protocolHeaderFontSizes = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36]
 const protocolHeaderAlignments: Array<{
   label: string
@@ -198,32 +239,38 @@ const createNumericSegment = (value: string): NumericSegment => ({
 })
 
 const createMarkerSegment = (): MarkerSegment => ({
+  defaultOptionIndex: null,
   id: createSegmentId(),
   type: 'marker',
   title: '',
-  options: [{ title: '', value: '' }],
+  options: [{ findingIds: [], title: '', value: '' }],
   selectedOptionIndex: null,
 })
 
 const createEmptyMarkerOption = (): MarkerOption => ({
+  findingIds: [],
   title: '',
   value: '',
 })
 
 const createManualMarkerOption = (): MarkerOption => ({
+  findingIds: [],
   title: 'Новая заготовка',
   value: '',
 })
 
-const standardMarkerOptionTitle = 'Стандартный'
+const standardMarkerOptionTitle = 'Начальная'
+const legacyStandardMarkerOptionTitles = new Set(['Стандартный'])
+const defaultMarkerOptionIcon = '★'
 
 const markerBoundaryReminderText =
-  'Добавьте метку, чтобы указать границы раздела'
+  'Добавьте метку # ниже, чтобы указать границы раздела'
 
 const markerOptionHasContent = (option: MarkerOption) =>
-  Boolean(option.title.trim() || option.value.trim())
+  Boolean(option.title.trim() || option.value.trim() || option.findingIds.length)
 
 const copyMarkerOption = (option: MarkerOption): MarkerOption => ({
+  findingIds: [...option.findingIds],
   title: option.title,
   value: option.value,
 })
@@ -236,8 +283,26 @@ const areMarkerOptionsEqual = (
   firstOptions.every(
     (option, index) =>
       option.title === secondOptions[index]?.title &&
+      option.findingIds.join('\n') ===
+        secondOptions[index]?.findingIds.join('\n') &&
       option.value === secondOptions[index]?.value,
   )
+
+const areMarkerOptionsSavedEqual = (
+  firstOption: MarkerOption | null | undefined,
+  secondOption: MarkerOption | null | undefined,
+) => {
+  if (!firstOption || !secondOption) {
+    return false
+  }
+
+  return (
+    firstOption.title.trim() === secondOption.title.trim() &&
+    getMarkerOptionComparableValue(firstOption.value) ===
+      getMarkerOptionComparableValue(secondOption.value) &&
+    firstOption.findingIds.join('\n') === secondOption.findingIds.join('\n')
+  )
+}
 
 const getMarkerOptionState = (
   segment: MarkerSegment,
@@ -254,51 +319,69 @@ const getMarkerOptionState = (
         )
   const normalizedSelectedIndex =
     selectedMeaningfulIndex === -1 ? null : selectedMeaningfulIndex
+  const defaultMeaningfulIndex =
+    segment.defaultOptionIndex === null
+      ? null
+      : meaningfulOptions.findIndex(
+          ({ originalIndex }) => originalIndex === segment.defaultOptionIndex,
+        )
+  const normalizedDefaultIndex =
+    defaultMeaningfulIndex === -1 ? null : defaultMeaningfulIndex
 
   if (!blockInfo?.hasNextMarker) {
     return {
+      defaultOptionIndex: normalizedDefaultIndex,
       options: meaningfulOptions.map(({ option }) => copyMarkerOption(option)),
       selectedOptionIndex: normalizedSelectedIndex,
     }
   }
 
   const standardOption: MarkerOption = {
-    title: standardMarkerOptionTitle,
+    findingIds: [],
+    title: '',
     value: blockInfo.value,
   }
 
   if (!meaningfulOptions.length) {
     return {
+      defaultOptionIndex: 0,
       options: [standardOption],
       selectedOptionIndex: null,
     }
   }
 
   const options = meaningfulOptions.map(({ option }) => copyMarkerOption(option))
-  const standardIndex = options.findIndex(
-    (option) => option.title.trim() === standardMarkerOptionTitle,
-  )
+  const standardOptionCandidate = options[0]
 
-  if (standardIndex === -1) {
-    return {
-      options: [standardOption, ...options],
-      selectedOptionIndex:
-        normalizedSelectedIndex === null ? null : normalizedSelectedIndex + 1,
-    }
-  }
-
-  if (!options[standardIndex].value.trim()) {
-    options[standardIndex] = {
-      ...options[standardIndex],
-      value: blockInfo.value,
-    }
+  options[0] = {
+    ...standardOptionCandidate,
+    title: legacyStandardMarkerOptionTitles.has(
+      standardOptionCandidate.title.trim(),
+    )
+      ? standardMarkerOptionTitle
+      : standardOptionCandidate.title,
+    value: standardOptionCandidate.value.trim()
+      ? standardOptionCandidate.value
+      : blockInfo.value,
   }
 
   return {
+    defaultOptionIndex: normalizedDefaultIndex ?? 0,
     options,
     selectedOptionIndex: normalizedSelectedIndex,
   }
 }
+
+const isStandardMarkerOptionIndex = (
+  index: number,
+  blockInfo: ReturnType<typeof getMarkerBlockInfo> | null,
+) => Boolean(blockInfo?.hasNextMarker && index === 0)
+
+const canDeleteMarkerOption = (
+  _option: MarkerOption,
+  blockInfo: ReturnType<typeof getMarkerBlockInfo> | null,
+  index: number,
+) => !isStandardMarkerOptionIndex(index, blockInfo)
 
 const getResolvedMarkerOptionIndex = (
   optionState: ReturnType<typeof getMarkerOptionState>,
@@ -311,28 +394,29 @@ const getResolvedMarkerOptionIndex = (
     return optionState.selectedOptionIndex
   }
 
-  if (!blockInfo?.hasNextMarker) {
+  if (
+    optionState.defaultOptionIndex !== null &&
+    optionState.defaultOptionIndex < optionState.options.length
+  ) {
+    return optionState.defaultOptionIndex
+  }
+
+  if (!blockInfo?.hasNextMarker || !optionState.options.length) {
     return null
   }
 
-  const standardIndex = optionState.options.findIndex(
-    (option) => option.title.trim() === standardMarkerOptionTitle,
-  )
-
-  return standardIndex === -1 ? null : standardIndex
+  return 0
 }
 
-const canDeleteMarkerOption = (
+const getMarkerOptionLabel = (
   option: MarkerOption,
+  index: number,
   blockInfo: ReturnType<typeof getMarkerBlockInfo> | null,
 ) =>
-  !(
-    blockInfo?.hasNextMarker &&
-    option.title.trim() === standardMarkerOptionTitle
-  )
-
-const getMarkerOptionLabel = (option: MarkerOption, index: number) =>
-  option.title.trim() || `Заготовка ${index + 1}`
+  option.title.trim() ||
+  (isStandardMarkerOptionIndex(index, blockInfo)
+    ? standardMarkerOptionTitle
+    : `Заготовка ${index + 1}`)
 
 const getMarkerOptionTextareaKey = (markerId: number, index: number) =>
   `${markerId}:${index}`
@@ -397,7 +481,19 @@ const getContentText = (content: EditorSegment[]) =>
   content.map(segmentToText).join('')
 
 const getFindingLabelText = (value: string) =>
-  value.replaceAll(markerText, ' ').replace(/\s+/g, ' ').trim()
+  value
+    .replaceAll(markerText, ' ')
+    .replace(/[{}]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+const getProtocolSavePreviewText = (value: string, maxLength = 120) => {
+  const text = getFindingLabelText(value)
+
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}...` : text
+}
+
+const stripSemanticBlockBraces = (value: string) => value.replace(/[{}]/g, '')
 
 const getTemplatePreviewText = (template: ProtocolTemplate) => {
   const previewText = [
@@ -410,7 +506,7 @@ const getTemplatePreviewText = (template: ProtocolTemplate) => {
 
 const segmentToProtocolText = (segment: EditorSegment) => {
   if (segment.type === 'text') {
-    return segment.text
+    return stripSemanticBlockBraces(segment.text)
   }
 
   if (segment.type === 'variant' || segment.type === 'number') {
@@ -495,7 +591,7 @@ const getSentenceTerminalEnd = (text: string, index: number) => {
   return end
 }
 
-const getSentenceRanges = (text: string) => {
+const getLegacySentenceRanges = (text: string) => {
   const ranges: TextRange[] = []
   let start: number | null = null
 
@@ -532,6 +628,110 @@ const getSentenceRanges = (text: string) => {
   return ranges.filter((range) => range.end > range.start)
 }
 
+const hasSemanticBlockSyntax = (text: string) =>
+  text.includes(semanticBlockOpen) || text.includes(semanticBlockClose)
+
+const getSemanticBlockInfos = (text: string) => {
+  const blocks: Array<TextRange & { contentEnd: number; contentStart: number }> = []
+  let blockStart: number | null = null
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+
+    if (char === semanticBlockOpen && blockStart === null) {
+      blockStart = index
+      continue
+    }
+
+    if (char === semanticBlockClose && blockStart !== null) {
+      const contentStart = blockStart + 1
+      const contentEnd = index
+      const trimmedRange = trimRangeWhitespace(text, {
+        start: contentStart,
+        end: contentEnd,
+      })
+
+      if (trimmedRange) {
+        blocks.push({
+          ...trimmedRange,
+          contentEnd,
+          contentStart,
+        })
+      }
+
+      blockStart = null
+    }
+  }
+
+  return blocks
+}
+
+const getSemanticBlockRanges = (text: string) =>
+  getSemanticBlockInfos(text).map(({ start, end }) => ({ start, end }))
+
+const getSemanticBlockAtOffset = (text: string, offset: number) => {
+  const normalizedOffset = Math.max(0, Math.min(offset, text.length))
+  let blockStart: number | null = null
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+
+    if (char === semanticBlockOpen && blockStart === null) {
+      blockStart = index
+      continue
+    }
+
+    if (char === semanticBlockClose && blockStart !== null) {
+      if (normalizedOffset > blockStart && normalizedOffset <= index) {
+        return {
+          contentEnd: index,
+          contentStart: blockStart + 1,
+          end: index + 1,
+          start: blockStart,
+        }
+      }
+
+      blockStart = null
+    }
+  }
+
+  return null
+}
+
+const getPreviousSemanticBlock = (text: string, offset: number) => {
+  const normalizedOffset = Math.max(0, Math.min(offset, text.length))
+
+  return (
+    getSemanticBlockInfos(text)
+      .map((block) => ({
+        contentEnd: block.contentEnd,
+        contentStart: block.contentStart,
+        end: block.contentEnd + 1,
+        start: block.contentStart - 1,
+      }))
+      .filter((block) => block.end <= normalizedOffset)
+      .at(-1) ?? null
+  )
+}
+
+const getOffsetAfterActiveSemanticBlock = (text: string, offset: number) => {
+  const block = getSemanticBlockAtOffset(text, offset)
+
+  if (!block) {
+    return offset
+  }
+
+  let nextOffset = block.end
+
+  while (text[nextOffset] === ' ' || text[nextOffset] === '\t') {
+    nextOffset += 1
+  }
+
+  return nextOffset
+}
+
+const getSentenceRanges = (text: string) => getSemanticBlockRanges(text)
+
 const getSentenceRangeAtOffset = (text: string, offset: number) => {
   const ranges = getSentenceRanges(text)
 
@@ -557,6 +757,23 @@ const getSentenceRangeAtOffset = (text: string, offset: number) => {
   )
 }
 
+const expandRangeToSemanticBlock = (text: string, range: TextRange) => {
+  const block =
+    getSemanticBlockAtOffset(text, range.start) ??
+    getSemanticBlockAtOffset(text, range.end)
+
+  if (block) {
+    return (
+      trimRangeWhitespace(text, {
+        start: block.contentStart,
+        end: block.contentEnd,
+      }) ?? { start: block.contentStart, end: block.contentStart }
+    )
+  }
+
+  return getBestOverlappingFindingRange(text, range) ?? range
+}
+
 const getRangeText = (text: string, range: TextRange) =>
   text.slice(range.start, range.end)
 
@@ -574,6 +791,42 @@ const trimRangeWhitespace = (text: string, range: TextRange) => {
 
   return end > start ? { start, end } : null
 }
+
+const excludeSemanticBlockBracesFromHighlightRanges = (
+  text: string,
+  ranges: TextRange[],
+) =>
+  ranges.flatMap((range) => {
+    const start = Math.max(0, Math.min(range.start, text.length))
+    const end = Math.max(start, Math.min(range.end, text.length))
+    const pieces: TextRange[] = []
+    let pieceStart: number | null = null
+
+    for (let index = start; index < end; index += 1) {
+      const char = text[index]
+
+      if (char === semanticBlockOpen || char === semanticBlockClose) {
+        if (pieceStart !== null && pieceStart < index) {
+          pieces.push({ start: pieceStart, end: index })
+        }
+
+        pieceStart = null
+        continue
+      }
+
+      pieceStart ??= index
+    }
+
+    if (pieceStart !== null && pieceStart < end) {
+      pieces.push({ start: pieceStart, end })
+    }
+
+    return pieces.flatMap((piece) => {
+      const trimmedPiece = trimRangeWhitespace(text, piece)
+
+      return trimmedPiece ? [trimmedPiece] : []
+    })
+  })
 
 const getPreviousNonWhitespaceIndex = (text: string, index: number) => {
   for (let currentIndex = index - 1; currentIndex >= 0; currentIndex -= 1) {
@@ -653,7 +906,7 @@ const getProtocolChangeHighlightRanges = (text: string, range: TextRange) => {
     ranges.push({ start: cursor, end: trimmedRange.end })
   }
 
-  return ranges
+  return excludeSemanticBlockBracesFromHighlightRanges(text, ranges)
 }
 
 const hasFindingContent = (value: string) =>
@@ -678,164 +931,6 @@ const getFindingRangeAtOffset = (text: string, offset: number) => {
 
 const getFindingRanges = (text: string) =>
   getSentenceRanges(text).filter((range) => isFindingText(text, range))
-
-const isSameRange = (first: TextRange, second: TextRange) =>
-  first.start === second.start && first.end === second.end
-
-const getRangeOverlap = (first: TextRange, second: TextRange) =>
-  Math.max(0, Math.min(first.end, second.end) - Math.max(first.start, second.start))
-
-const getTextChange = (
-  previousText: string,
-  nextText: string,
-): TextChange | null => {
-  if (previousText === nextText) {
-    return null
-  }
-
-  let start = 0
-
-  while (
-    start < previousText.length &&
-    start < nextText.length &&
-    previousText[start] === nextText[start]
-  ) {
-    start += 1
-  }
-
-  let suffixLength = 0
-
-  while (
-    suffixLength < previousText.length - start &&
-    suffixLength < nextText.length - start &&
-    previousText[previousText.length - 1 - suffixLength] ===
-      nextText[nextText.length - 1 - suffixLength]
-  ) {
-    suffixLength += 1
-  }
-
-  return {
-    nextRange: {
-      start,
-      end: nextText.length - suffixLength,
-    },
-    previousRange: {
-      start,
-      end: previousText.length - suffixLength,
-    },
-  }
-}
-
-const mergeTextRanges = (ranges: TextRange[]) => {
-  const sortedRanges = ranges
-    .filter((range) => range.end > range.start)
-    .sort((first, second) => first.start - second.start)
-  const mergedRanges: TextRange[] = []
-
-  sortedRanges.forEach((range) => {
-    const previous = mergedRanges.at(-1)
-
-    if (previous && range.start <= previous.end) {
-      previous.end = Math.max(previous.end, range.end)
-      return
-    }
-
-    mergedRanges.push({ ...range })
-  })
-
-  return mergedRanges
-}
-
-const adjustTrackedRangesForEdit = (
-  ranges: TextRange[],
-  editStart: number,
-  delta: number,
-) => {
-  if (delta === 0) {
-    return ranges
-  }
-
-  const deletionEnd = delta < 0 ? editStart - delta : editStart
-
-  return mergeTextRanges(
-    ranges.flatMap((range) => {
-      if (delta > 0) {
-        if (range.start >= editStart) {
-          return [{ start: range.start + delta, end: range.end + delta }]
-        }
-
-        if (range.end > editStart) {
-          return [{ start: range.start, end: range.end + delta }]
-        }
-
-        return [range]
-      }
-
-      if (range.end <= editStart) {
-        return [range]
-      }
-
-      if (range.start >= deletionEnd) {
-        return [{ start: range.start + delta, end: range.end + delta }]
-      }
-
-      const nextRange = {
-        start: range.start,
-        end: Math.max(editStart, range.end + delta),
-      }
-
-      return nextRange.end > nextRange.start ? [nextRange] : []
-    }),
-  )
-}
-
-const adjustTrackedRangesForReplacement = (
-  ranges: TextRange[],
-  previousRange: TextRange,
-  nextRange: TextRange,
-) => {
-  const delta =
-    nextRange.end -
-    nextRange.start -
-    (previousRange.end - previousRange.start)
-
-  return mergeTextRanges(
-    ranges.flatMap((range) => {
-      if (range.end <= previousRange.start) {
-        return [range]
-      }
-
-      if (range.start >= previousRange.end) {
-        return [{ start: range.start + delta, end: range.end + delta }]
-      }
-
-      const nextRanges: TextRange[] = []
-
-      if (range.start < previousRange.start) {
-        nextRanges.push({ start: range.start, end: previousRange.start })
-      }
-
-      if (range.end > previousRange.end) {
-        nextRanges.push({
-          start: nextRange.end,
-          end: range.end + delta,
-        })
-      }
-
-      return nextRanges
-    }),
-  )
-}
-
-const trackTextChangeRange = (ranges: TextRange[], change: TextChange) =>
-  mergeTextRanges([
-    ...adjustTrackedRangesForReplacement(
-      ranges,
-      change.previousRange,
-      change.nextRange,
-    ),
-    ...(change.nextRange.end > change.nextRange.start ? [change.nextRange] : []),
-  ])
 
 const getTrackedFindingRanges = (text: string, trackedRanges: TextRange[]) =>
   getFindingRanges(text).filter((findingRange) =>
@@ -869,30 +964,16 @@ const getBestOverlappingPair = (
     .sort((first, second) => second.overlap - first.overlap)[0]?.pair ?? null
 
 const isCompletedConclusion = (text: string, range: TextRange) =>
-  sentenceTerminalPattern.test(getRangeText(text, range).trim())
+  Boolean(getFindingLabelText(getRangeText(text, range)))
 
-const getSentenceCompletionEdit = (text: string, range: TextRange) => {
-  if (!isFindingText(text, range) || isCompletedConclusion(text, range)) {
-    return null
-  }
+const getSentenceCompletionEdit = (
+  text: string,
+  range: TextRange,
+): { previousRange: TextRange; text: string } | null => {
+  void text
+  void range
 
-  const value = getRangeText(text, range)
-  const trailingSpaceLength = value.match(/\s*$/)?.[0].length ?? 0
-  const editEnd = range.end - trailingSpaceLength
-
-  if (editEnd <= range.start) {
-    return null
-  }
-
-  const lastChar = text[editEnd - 1]
-  const replaceTrailingSoftPunctuation = lastChar === ',' || lastChar === ';'
-
-  return {
-    previousRange: replaceTrailingSoftPunctuation
-      ? { start: editEnd - 1, end: editEnd }
-      : { start: editEnd, end: editEnd },
-    text: '.',
-  }
+  return null
 }
 
 const getPairRange = (pair: FindingPair, field: FieldName) =>
@@ -907,9 +988,6 @@ const setPairRange = (
     ? { ...pair, description: range }
     : { ...pair, conclusion: range }
 
-const isOffsetInRange = (range: TextRange, offset: number) =>
-  offset >= range.start && offset <= Math.max(range.start, range.end)
-
 const findPairAtOffset = (
   pairs: FindingPair[],
   field: FieldName,
@@ -917,38 +995,6 @@ const findPairAtOffset = (
 ) =>
   pairs.find((pair) => isOffsetInRange(getPairRange(pair, field), offset)) ??
   null
-
-const getTextChangeDelta = (change: TextChange) =>
-  change.nextRange.end -
-  change.nextRange.start -
-  (change.previousRange.end - change.previousRange.start)
-
-const getTextChangeFromEdit = (
-  editStart: number,
-  delta: number,
-): TextChange => ({
-  nextRange:
-    delta > 0
-      ? { start: editStart, end: editStart + delta }
-      : { start: editStart, end: editStart },
-  previousRange:
-    delta < 0
-      ? { start: editStart, end: editStart - delta }
-      : { start: editStart, end: editStart },
-})
-
-const clampTextRange = (range: TextRange, text: string): TextRange => {
-  const start = Math.max(0, Math.min(range.start, text.length))
-  const end = Math.max(start, Math.min(range.end, text.length))
-
-  return { start, end }
-}
-
-const createCollapsedTextRange = (offset: number, text: string) => {
-  const safeOffset = Math.max(0, Math.min(offset, text.length))
-
-  return { start: safeOffset, end: safeOffset }
-}
 
 const getBestOverlappingFindingRange = (text: string, range: TextRange) =>
   getFindingRanges(text)
@@ -981,48 +1027,6 @@ const normalizePairRangeCandidate = (
   return field === 'conclusion'
     ? createCollapsedTextRange(candidate.start, text)
     : null
-}
-
-const mapRangeThroughTextChange = (
-  range: TextRange,
-  change: TextChange,
-): TextRange => {
-  const delta = getTextChangeDelta(change)
-
-  if (range.end <= change.previousRange.start) {
-    return { ...range }
-  }
-
-  if (range.start >= change.previousRange.end) {
-    return {
-      start: Math.max(0, range.start + delta),
-      end: Math.max(0, range.end + delta),
-    }
-  }
-
-  const start =
-    range.start < change.previousRange.start
-      ? range.start
-      : change.nextRange.start
-  const end =
-    range.end > change.previousRange.end
-      ? range.end + delta
-      : change.nextRange.end
-
-  return {
-    start: Math.max(0, start),
-    end: Math.max(Math.max(0, start), end),
-  }
-}
-
-const doesTextChangeTouchRange = (range: TextRange, change: TextChange) => {
-  const isInsertion = change.previousRange.start === change.previousRange.end
-
-  if (isInsertion) {
-    return isOffsetInRange(range, change.previousRange.start)
-  }
-
-  return getRangeOverlap(range, change.previousRange) > 0
 }
 
 const adjustPairRangeForTextChange = (
@@ -1085,7 +1089,10 @@ const dedupeFindingPairsByDescription = (pairs: FindingPair[]) => {
       existing.conclusion.end - existing.conclusion.start
     const conclusionLength = pair.conclusion.end - pair.conclusion.start
 
-    if (conclusionLength > existingConclusionLength) {
+    if (
+      conclusionLength > existingConclusionLength ||
+      (!existing.savedFindingId && pair.savedFindingId)
+    ) {
       result[existingIndex] = pair
     }
   })
@@ -1210,113 +1217,6 @@ const parseMarkerTemplateContent = (value: string) => {
   }
 
   return tokenizeNumericTextSegments(compactContent(segments))
-}
-
-const parseMarkerOptionVariantToken = (
-  value: string,
-  start: number,
-  end: number,
-) => {
-  const token = value.slice(start, end)
-
-  if (!token.startsWith('[[') || !token.endsWith(']]')) {
-    return null
-  }
-
-  const options = token
-    .slice(2, -2)
-    .split('|')
-    .map((option) => option.trim())
-
-  return options.some(Boolean)
-    ? {
-        options,
-        value: options.find(Boolean) ?? '',
-      }
-    : null
-}
-
-const createMarkerOptionVariantToken = (options: string[]) =>
-  `[[${options.map((option) => option.trim()).join('|')}]]`
-
-const getMarkerTemplateParts = (value: string) => {
-  const parts: Array<
-    | { rawEnd: number; rawStart: number; text: string; type: 'text' }
-    | {
-        options: string[]
-        rawEnd: number
-        rawStart: number
-        type: 'variant'
-        value: string
-      }
-  > = []
-  let cursor = 0
-
-  while (cursor < value.length) {
-    const variantStart = value.indexOf('[[', cursor)
-
-    if (variantStart === -1) {
-      const text = value.slice(cursor)
-
-      if (text) {
-        parts.push({
-          rawEnd: value.length,
-          rawStart: cursor,
-          text,
-          type: 'text',
-        })
-      }
-      break
-    }
-
-    if (variantStart > cursor) {
-      parts.push({
-        rawEnd: variantStart,
-        rawStart: cursor,
-        text: value.slice(cursor, variantStart),
-        type: 'text',
-      })
-    }
-
-    const variantEnd = value.indexOf(']]', variantStart + 2)
-
-    if (variantEnd === -1) {
-      parts.push({
-        rawEnd: value.length,
-        rawStart: variantStart,
-        text: value.slice(variantStart),
-        type: 'text',
-      })
-      break
-    }
-
-    const tokenEnd = variantEnd + 2
-    const options = value
-      .slice(variantStart + 2, variantEnd)
-      .split('|')
-      .map((option) => option.trim())
-
-    if (options.some(Boolean)) {
-      parts.push({
-        options,
-        rawEnd: tokenEnd,
-        rawStart: variantStart,
-        type: 'variant',
-        value: options.find(Boolean) ?? '',
-      })
-    } else {
-      parts.push({
-        rawEnd: tokenEnd,
-        rawStart: variantStart,
-        text: value.slice(variantStart, tokenEnd),
-        type: 'text',
-      })
-    }
-
-    cursor = tokenEnd
-  }
-
-  return parts
 }
 
 const markerOptionValueToHtml = (value: string) =>
@@ -1490,6 +1390,17 @@ const markerToHtml = (
   return `<span class="${className}" contenteditable="false" data-marker-id="${segment.id}" data-marker-label="${escapeHtml(label)}" aria-label="${escapeHtml(titleText)}" title="${escapeHtml(titleText)}">${markerText}</span>`
 }
 
+const textToEditorHtml = (value: string) =>
+  escapeHtml(value)
+    .replaceAll(
+      semanticBlockOpen,
+      `<span class="semantic-block-brace">${semanticBlockOpen}</span>`,
+    )
+    .replaceAll(
+      semanticBlockClose,
+      `<span class="semantic-block-brace">${semanticBlockClose}</span>`,
+    )
+
 const segmentToHtml = (
   segment: EditorSegment,
   markerNumber = 0,
@@ -1497,7 +1408,7 @@ const segmentToHtml = (
   isTerminalMarker = false,
 ) => {
   if (segment.type === 'text') {
-    return escapeHtml(segment.text)
+    return textToEditorHtml(segment.text)
   }
 
   if (segment.type === 'variant') {
@@ -1604,7 +1515,7 @@ const contentToHtml = (
       }
 
       html += wrapHtml(
-        escapeHtml(value),
+        textToEditorHtml(value),
         getClassName(segmentStart + start, segmentStart + end),
       )
     })
@@ -1704,6 +1615,58 @@ const removeRangeFromContent = (
   return compactContent(nextContent)
 }
 
+const getFindingRemovalRange = (text: string, range: TextRange) => {
+  const block =
+    getSemanticBlockAtOffset(text, range.start) ??
+    getSemanticBlockAtOffset(text, Math.max(range.start, range.end - 1))
+
+  if (!block) {
+    return clampTextRange(range, text)
+  }
+
+  let end = block.end
+
+  while (end < text.length && /[ \t]/.test(text[end])) {
+    end += 1
+  }
+
+  return { start: block.start, end }
+}
+
+const removeTextRangesFromContent = (
+  content: EditorSegment[],
+  ranges: TextRange[],
+) => {
+  let nextContent = content
+  const changes: Array<TextChange & { nextText: string }> = []
+  const removalRanges = mergeTextRanges(ranges).sort(
+    (first, second) => second.start - first.start,
+  )
+
+  removalRanges.forEach((range) => {
+    const text = getContentText(nextContent)
+    const safeRange = clampTextRange(range, text)
+
+    if (safeRange.end <= safeRange.start) {
+      return
+    }
+
+    nextContent = removeRangeFromContent(
+      nextContent,
+      safeRange.start,
+      safeRange.end,
+    )
+
+    changes.push({
+      nextRange: { start: safeRange.start, end: safeRange.start },
+      nextText: getContentText(nextContent),
+      previousRange: safeRange,
+    })
+  })
+
+  return { changes, content: nextContent }
+}
+
 const insertContentAtOffset = (
   content: EditorSegment[],
   offset: number,
@@ -1775,37 +1738,141 @@ const replaceRangeWithContent = (
     insertedContent,
   )
 
-const getLastNonWhitespaceOffset = (text: string) => {
-  for (let index = text.length - 1; index >= 0; index -= 1) {
-    if (!/\s/.test(text[index])) {
-      return index
+const ensureSemanticBlockSpacesInContent = (content: EditorSegment[]) => {
+  const text = getContentText(content)
+  let nextContent = content
+  let shift = 0
+
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] !== semanticBlockClose) {
+      continue
     }
+
+    const nextChar = text[index + 1]
+
+    if (nextChar && /\s/.test(nextChar)) {
+      continue
+    }
+
+    nextContent = insertContentAtOffset(nextContent, index + 1 + shift, [
+      createTextSegment(' '),
+    ])
+    shift += 1
   }
 
-  return null
+  return compactContent(nextContent)
 }
 
-const completeFinalFindingInContent = (content: EditorSegment[]) => {
-  const text = getContentText(content)
-  const lastOffset = getLastNonWhitespaceOffset(text)
+const getSemanticWrapIntervals = (text: string) => {
+  const intervals: TextRange[] = []
+  let start = 0
 
-  if (lastOffset === null) {
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] !== markerText) {
+      continue
+    }
+
+    if (start < index) {
+      intervals.push({ start, end: index })
+    }
+
+    start = index + markerText.length
+  }
+
+  if (start < text.length) {
+    intervals.push({ start, end: text.length })
+  }
+
+  return intervals
+}
+
+const wrapPlainTextInSemanticBlocks = (content: EditorSegment[]) => {
+  const text = getContentText(content)
+
+  if (!text.trim() || hasSemanticBlockSyntax(text)) {
+    return ensureSemanticBlockSpacesInContent(content)
+  }
+
+  const ranges = getSemanticWrapIntervals(text).flatMap((interval) => {
+    const intervalText = text.slice(interval.start, interval.end)
+
+    return getLegacySentenceRanges(intervalText).flatMap((range) => {
+      const trimmedRange = trimRangeWhitespace(intervalText, range)
+
+      return trimmedRange
+        ? [
+            {
+              start: interval.start + trimmedRange.start,
+              end: interval.start + trimmedRange.end,
+            },
+          ]
+        : []
+    })
+  })
+
+  if (!ranges.length) {
     return content
   }
 
-  const finalRange = getFindingRangeAtOffset(text, lastOffset)
-  const completionEdit = finalRange
-    ? getSentenceCompletionEdit(text, finalRange)
-    : null
+  let nextContent = content
+  let shift = 0
 
-  return completionEdit
-    ? replaceRangeWithContent(
-        content,
-        completionEdit.previousRange.start,
-        completionEdit.previousRange.end,
-        [createTextSegment(completionEdit.text)],
-      )
-    : content
+  ranges.forEach((range) => {
+    nextContent = insertContentAtOffset(nextContent, range.start + shift, [
+      createTextSegment(semanticBlockOpen),
+    ])
+    shift += semanticBlockOpen.length
+    nextContent = insertContentAtOffset(nextContent, range.end + shift, [
+      createTextSegment(`${semanticBlockClose} `),
+    ])
+    shift += semanticBlockClose.length + 1
+  })
+
+  return ensureSemanticBlockSpacesInContent(compactContent(nextContent))
+}
+
+const ensureSemanticBlocksInContent = (content: EditorSegment[]) =>
+  wrapPlainTextInSemanticBlocks(compactContent(content))
+
+const completeFinalFindingInContent = (content: EditorSegment[]) =>
+  ensureSemanticBlocksInContent(content)
+
+const stripSemanticBlockBracesFromContent = (content: EditorSegment[]) =>
+  compactContent(
+    content.flatMap((segment): EditorSegment[] => {
+      if (segment.type !== 'text') {
+        return [segment]
+      }
+
+      const text = stripSemanticBlockBraces(segment.text)
+
+      return text ? [{ ...segment, text }] : []
+    }),
+  )
+
+const hasMalformedSemanticBlockSyntax = (text: string) => {
+  let hasOpenBlock = false
+
+  for (const char of text) {
+    if (char === semanticBlockOpen) {
+      if (hasOpenBlock) {
+        return true
+      }
+
+      hasOpenBlock = true
+      continue
+    }
+
+    if (char === semanticBlockClose) {
+      if (!hasOpenBlock) {
+        return true
+      }
+
+      hasOpenBlock = false
+    }
+  }
+
+  return hasOpenBlock
 }
 
 const copySegment = (segment: EditorSegment): EditorSegment => {
@@ -1827,11 +1894,234 @@ const copySegment = (segment: EditorSegment): EditorSegment => {
   return {
     ...segment,
     title: segment.title ?? '',
-    options: segment.options.map((option) => ({ ...option })),
+    options: segment.options.map(copyMarkerOption),
   }
 }
 
 const copyContent = (content: EditorSegment[]) => content.map(copySegment)
+
+const copySegmentWithFreshId = (segment: EditorSegment): EditorSegment => {
+  if (segment.type === 'text') {
+    return createTextSegment(segment.text)
+  }
+
+  if (segment.type === 'variant') {
+    return {
+      id: createSegmentId(),
+      options: [...segment.options],
+      type: 'variant',
+      value: segment.value,
+    }
+  }
+
+  if (segment.type === 'number') {
+    return createNumericSegment(segment.value)
+  }
+
+  return {
+    id: createSegmentId(),
+    defaultOptionIndex: segment.defaultOptionIndex,
+    options: segment.options.map(copyMarkerOption),
+    selectedOptionIndex: segment.selectedOptionIndex,
+    title: segment.title,
+    type: 'marker',
+  }
+}
+
+const copyContentWithFreshIds = (content: EditorSegment[]) =>
+  content.map(copySegmentWithFreshId)
+
+const sliceContentRange = (
+  content: EditorSegment[],
+  range: TextRange,
+): EditorSegment[] => {
+  let cursor = 0
+  const fragment: EditorSegment[] = []
+
+  content.forEach((segment) => {
+    const text = segmentToText(segment)
+    const segmentStart = cursor
+    const segmentEnd = cursor + text.length
+    cursor = segmentEnd
+
+    if (segmentEnd <= range.start || segmentStart >= range.end) {
+      return
+    }
+
+    if (segment.type === 'text') {
+      const start = Math.max(0, range.start - segmentStart)
+      const end = Math.min(text.length, range.end - segmentStart)
+      const slicedText = text.slice(start, end)
+
+      if (slicedText) {
+        fragment.push(createTextSegment(slicedText))
+      }
+
+      return
+    }
+
+    fragment.push(copySegmentWithFreshId(segment))
+  })
+
+  return compactContent(fragment)
+}
+
+const getMarkerBlockValueRange = (
+  content: EditorSegment[],
+  blockInfo: NonNullable<ReturnType<typeof getMarkerBlockInfo>>,
+) => {
+  const text = getContentText(content)
+  const start =
+    text[blockInfo.blockStart] === '\n'
+      ? blockInfo.blockStart + 1
+      : blockInfo.blockStart
+  const rawText = text.slice(start, blockInfo.blockEnd)
+  const end =
+    blockInfo.hasNextMarker && rawText.endsWith('\n')
+      ? blockInfo.blockEnd - 1
+      : blockInfo.blockEnd
+
+  return { start, end: Math.max(start, end) }
+}
+
+const getMarkerMainBlockReplacementRange = (
+  content: EditorSegment[],
+  blockInfo: NonNullable<ReturnType<typeof getMarkerBlockInfo>>,
+) => {
+  const text = getContentText(content)
+  const valueRange = getMarkerBlockValueRange(content, blockInfo)
+  const mainBlock =
+    getSemanticBlockInfos(text).find(
+      (block) =>
+        block.contentStart >= valueRange.start &&
+        block.contentEnd <= valueRange.end,
+    ) ?? null
+
+  return mainBlock
+    ? getFindingRemovalRange(text, mainBlock)
+    : valueRange
+}
+
+const getVariantMarkerOptionValues = (segment: VariantSegment) => {
+  const selectedValue = segment.value.trim()
+  const values = [
+    selectedValue,
+    ...segment.options.filter((option) => option.trim() !== selectedValue),
+  ].filter((option) => option.trim())
+
+  return values.length ? values : [segment.value]
+}
+
+const segmentToMarkerOptionTemplateValue = (segment: EditorSegment) => {
+  if (segment.type === 'text') {
+    return stripSemanticBlockBraces(segment.text)
+  }
+
+  if (segment.type === 'variant') {
+    return createMarkerOptionVariantToken(getVariantMarkerOptionValues(segment))
+  }
+
+  if (segment.type === 'number') {
+    return segment.value
+  }
+
+  return ''
+}
+
+const getSingleSemanticBlockMarkerOptionValue = (
+  content: EditorSegment[],
+  blockInfo: NonNullable<ReturnType<typeof getMarkerBlockInfo>>,
+) => {
+  const valueRange = getMarkerBlockValueRange(content, blockInfo)
+  const text = getContentText(content)
+  const mainBlockRange =
+    getSemanticBlockInfos(text).find(
+      (block) =>
+        block.contentStart >= valueRange.start &&
+        block.contentEnd <= valueRange.end,
+    ) ?? null
+  const mainRange = mainBlockRange
+    ? { start: mainBlockRange.start, end: mainBlockRange.end }
+    : valueRange
+  const value = sliceContentRange(content, mainRange)
+    .map(segmentToMarkerOptionTemplateValue)
+    .join('')
+    .trim()
+
+  return `${semanticBlockOpen}${value}${semanticBlockClose} `
+}
+
+const normalizeMarkerOptionStateForSectionSave = (
+  content: EditorSegment[],
+  blockInfo: NonNullable<ReturnType<typeof getMarkerBlockInfo>>,
+  optionState: ReturnType<typeof getMarkerOptionState>,
+) => {
+  if (!blockInfo.hasNextMarker || !optionState.options.length) {
+    return optionState
+  }
+
+  const mainBlockValue = getSingleSemanticBlockMarkerOptionValue(
+    content,
+    blockInfo,
+  )
+
+  return {
+    ...optionState,
+    options: optionState.options.map((option, index) =>
+      index === 0 ? { ...option, value: mainBlockValue } : option,
+    ),
+  }
+}
+
+const areMarkerOptionTitlesAndFindingsEqual = (
+  firstOption: MarkerOption | null | undefined,
+  secondOption: MarkerOption | null | undefined,
+) =>
+  Boolean(
+    firstOption &&
+      secondOption &&
+      firstOption.title.trim() === secondOption.title.trim() &&
+      firstOption.findingIds.join('\n') === secondOption.findingIds.join('\n'),
+  )
+
+const getMarkerFindingRanges = (
+  content: EditorSegment[],
+  blockInfo: NonNullable<ReturnType<typeof getMarkerBlockInfo>>,
+) => {
+  const text = getContentText(content)
+  const valueRange = getMarkerBlockValueRange(content, blockInfo)
+  const blocks = getSemanticBlockInfos(text).filter(
+    (block) =>
+      block.contentStart >= valueRange.start &&
+      block.contentEnd <= valueRange.end,
+  )
+
+  return blocks
+    .slice(1)
+    .map((block) => ({ start: block.start, end: block.end }))
+    .filter((range) => hasFindingContent(getRangeText(text, range)))
+}
+
+const isAdditionalMarkerFindingRange = (
+  content: EditorSegment[],
+  range: TextRange,
+) => {
+  const markerId = getMarkerIdAtOffset(content, range.start)
+
+  if (markerId === null) {
+    return true
+  }
+
+  const blockInfo = getMarkerBlockInfo(content, markerId)
+
+  if (!blockInfo) {
+    return true
+  }
+
+  return getMarkerFindingRanges(content, blockInfo).some(
+    (findingRange) => getRangeOverlap(findingRange, range) > 0,
+  )
+}
 
 const getContentStructureSignature = (content: EditorSegment[]) =>
   content
@@ -1850,7 +2140,7 @@ const getContentStructureSignature = (content: EditorSegment[]) =>
         return `number:${segment.id}:${segment.value}`
       }
 
-      return `marker:${segment.id}:${segment.title}:${segment.selectedOptionIndex}:${JSON.stringify(
+      return `marker:${segment.id}:${segment.title}:${segment.selectedOptionIndex}:${segment.defaultOptionIndex}:${JSON.stringify(
         segment.options,
       )}`
     })
@@ -2038,6 +2328,223 @@ const getMarkerIdAtOffset = (content: EditorSegment[], offset: number) => {
   }
 
   return null
+}
+
+const ensureTerminalMarkerContent = (content: EditorSegment[]) => {
+  const normalizedContent = ensureLeadingMarkerContent(content)
+
+  if (getTerminalMarkerRange(normalizedContent)) {
+    return normalizedContent
+  }
+
+  const text = getContentText(normalizedContent)
+  const prefix = text && text[text.length - 1] !== '\n' ? '\n' : ''
+
+  return compactContent([
+    ...normalizedContent,
+    ...(prefix ? [createTextSegment(prefix)] : []),
+    createMarkerSegment(),
+  ])
+}
+
+const getDescriptionParagraphs = (description: string) =>
+  description
+    .replace(/\r\n?/g, '\n')
+    .split(/\n+/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean)
+
+const createStartTemplateDescriptionContent = (description: string) => {
+  const paragraphs = getDescriptionParagraphs(description)
+
+  if (!paragraphs.length) {
+    return ensureTerminalMarkerContent([])
+  }
+
+  return compactContent([
+    ...paragraphs.flatMap((paragraph): EditorSegment[] => [
+      createMarkerSegment(),
+      createTextSegment(
+        `${semanticBlockOpen}${paragraph}${semanticBlockClose}\n`,
+      ),
+    ]),
+    createMarkerSegment(),
+  ])
+}
+
+const getTemplateBuilderSectionMarkers = (content: EditorSegment[]) => {
+  const markers = getMarkerMap(content)
+  const terminalMarkerId = getTerminalMarkerRange(content)?.id ?? null
+
+  return getMarkerRanges(content).flatMap((range, index) => {
+    if (range.id === terminalMarkerId) {
+      return []
+    }
+
+    const segment = markers.get(range.id)
+
+    return segment ? [{ number: index + 1, segment }] : []
+  })
+}
+
+const getSectionStructureMarkerEntries = (content: EditorSegment[]) => {
+  const markers = getMarkerMap(content)
+  const terminalMarkerId = getTerminalMarkerRange(content)?.id ?? null
+
+  return getMarkerRanges(content).flatMap((range, index) => {
+    if (range.id === terminalMarkerId) {
+      return []
+    }
+
+    const segment = markers.get(range.id)
+
+    return segment ? [{ id: range.id, number: index + 1, segment }] : []
+  })
+}
+
+const getSectionStructureMarkerTitle = (
+  segment: MarkerSegment,
+  number: number,
+) => segment.title.trim() || `Раздел ${number}`
+
+const getSectionStructureChanges = (
+  templateContent: EditorSegment[],
+  currentContent: EditorSegment[],
+) => {
+  const templateEntries = getSectionStructureMarkerEntries(templateContent)
+  const currentEntries = getSectionStructureMarkerEntries(currentContent)
+  const templateIds = new Set(templateEntries.map((entry) => entry.id))
+  const currentIds = new Set(currentEntries.map((entry) => entry.id))
+  const addedSectionNames = currentEntries
+    .filter((entry) => !templateIds.has(entry.id))
+    .map((entry) =>
+      getSectionStructureMarkerTitle(entry.segment, entry.number),
+    )
+  const removedSectionNames = templateEntries
+    .filter((entry) => !currentIds.has(entry.id))
+    .map((entry) =>
+      getSectionStructureMarkerTitle(entry.segment, entry.number),
+    )
+
+  return addedSectionNames.length || removedSectionNames.length
+    ? { addedSectionNames, removedSectionNames }
+    : null
+}
+
+const formatSectionStructureChangeDetail = (
+  changes: NonNullable<ReturnType<typeof getSectionStructureChanges>>,
+) =>
+  [
+    changes.addedSectionNames.length
+      ? `Добавлены: ${changes.addedSectionNames.join(', ')}`
+      : '',
+    changes.removedSectionNames.length
+      ? `Удалены: ${changes.removedSectionNames.join(', ')}`
+      : '',
+  ]
+    .filter(Boolean)
+    .join('; ')
+
+const insertSectionMarkerIntoContent = (
+  content: EditorSegment[],
+  offset: number,
+) => {
+  const normalizedContent = ensureLeadingMarkerContent(content)
+  const text = getContentText(normalizedContent)
+  const safeOffset = Math.max(0, Math.min(offset, text.length))
+  const semanticBlock = getSemanticBlockAtOffset(text, safeOffset)
+  const isInsideSemanticBlock =
+    semanticBlock &&
+    safeOffset > semanticBlock.contentStart &&
+    safeOffset < semanticBlock.contentEnd
+  const splitStart =
+    isInsideSemanticBlock
+      ? (() => {
+          let index = safeOffset
+
+          while (
+            index > semanticBlock.contentStart &&
+            /\s/.test(text[index - 1])
+          ) {
+            index -= 1
+          }
+
+          return index
+        })()
+      : safeOffset
+  const splitEnd =
+    isInsideSemanticBlock
+      ? (() => {
+          let index = safeOffset
+
+          while (
+            index < semanticBlock.contentEnd &&
+            /\s/.test(text[index])
+          ) {
+            index += 1
+          }
+
+          return index
+        })()
+      : safeOffset
+  const hasSplitLeftText =
+    isInsideSemanticBlock &&
+    getFindingLabelText(text.slice(semanticBlock.contentStart, splitStart))
+  const hasSplitRightText =
+    isInsideSemanticBlock &&
+    getFindingLabelText(text.slice(splitEnd, semanticBlock.contentEnd))
+  const shouldSplitSemanticBlock = Boolean(
+    isInsideSemanticBlock && hasSplitLeftText && hasSplitRightText,
+  )
+  const terminalMarkerRange = getTerminalMarkerRange(normalizedContent)
+  const baseInsertionOffset = shouldSplitSemanticBlock
+    ? splitStart
+    : isInsideSemanticBlock && !hasSplitLeftText && semanticBlock
+      ? semanticBlock.start
+      : isInsideSemanticBlock && !hasSplitRightText && semanticBlock
+        ? semanticBlock.end
+        : safeOffset
+  const insertionOffset =
+    terminalMarkerRange && baseInsertionOffset >= terminalMarkerRange.start
+      ? terminalMarkerRange.start
+      : baseInsertionOffset
+  const marker = createMarkerSegment()
+  const prefix =
+    insertionOffset > 0 && text[insertionOffset - 1] !== '\n' ? '\n' : ''
+  const insertedContent: EditorSegment[] = shouldSplitSemanticBlock
+    ? [
+        createTextSegment(`${semanticBlockClose}\n`),
+        marker,
+        createTextSegment(semanticBlockOpen),
+      ]
+    : prefix
+      ? [createTextSegment(prefix), marker]
+      : [marker]
+  const nextContent = shouldSplitSemanticBlock
+    ? replaceRangeWithContent(
+        normalizedContent,
+        splitStart,
+        splitEnd,
+        insertedContent,
+      )
+    : insertContentAtOffset(
+        normalizedContent,
+        insertionOffset,
+        insertedContent,
+      )
+  const nextOffset = shouldSplitSemanticBlock
+    ? splitStart +
+      semanticBlockClose.length +
+      1 +
+      markerText.length +
+      semanticBlockOpen.length
+    : insertionOffset + prefix.length + markerText.length
+
+  return {
+    content: ensureLeadingMarkerContent(nextContent),
+    marker,
+    offset: nextOffset,
+  }
 }
 
 const syncVariantText = (
@@ -2583,10 +3090,11 @@ const parseEditorContent = (
       const previousMarker = markers.get(id)
 
       parsed.push({
+        defaultOptionIndex: previousMarker?.defaultOptionIndex ?? null,
         id: Number.isNaN(id) ? createSegmentId() : id,
         title: previousMarker?.title ?? '',
         options: previousMarker?.options.length
-          ? previousMarker.options.map((option) => ({ ...option }))
+          ? previousMarker.options.map(copyMarkerOption)
           : [createEmptyMarkerOption()],
         selectedOptionIndex: previousMarker?.selectedOptionIndex ?? null,
         type: 'marker',
@@ -2650,7 +3158,7 @@ const sanitizeMarkerOptions = (value: unknown) => {
 
   const options = value.flatMap((option): MarkerOption[] => {
     if (typeof option === 'string') {
-      return [{ title: '', value: option }]
+      return [{ findingIds: [], title: '', value: option }]
     }
 
     if (!isRecord(option)) {
@@ -2659,6 +3167,11 @@ const sanitizeMarkerOptions = (value: unknown) => {
 
     return [
       {
+        findingIds: Array.isArray(option.findingIds)
+          ? option.findingIds.filter(
+              (findingId): findingId is string => typeof findingId === 'string',
+            )
+          : [],
         title: sanitizeString(option.title),
         value: sanitizeString(option.value),
       },
@@ -2720,8 +3233,16 @@ const sanitizeEditorSegment = (value: unknown): EditorSegment | null => {
       value.selectedOptionIndex < options.length
         ? value.selectedOptionIndex
         : null
+    const defaultOptionIndex =
+      typeof value.defaultOptionIndex === 'number' &&
+      Number.isInteger(value.defaultOptionIndex) &&
+      value.defaultOptionIndex >= 0 &&
+      value.defaultOptionIndex < options.length
+        ? value.defaultOptionIndex
+        : null
 
     return {
+      defaultOptionIndex,
       id,
       options,
       selectedOptionIndex,
@@ -2734,7 +3255,7 @@ const sanitizeEditorSegment = (value: unknown): EditorSegment | null => {
 }
 
 const sanitizeEditorContent = (value: unknown) =>
-  compactContent(
+  ensureSemanticBlocksInContent(
     Array.isArray(value)
       ? value.flatMap((item) => {
           const segment = sanitizeEditorSegment(item)
@@ -2773,6 +3294,10 @@ const sanitizeFindingPair = (value: unknown): FindingPair | null => {
       typeof value.id === 'number' && Number.isFinite(value.id)
         ? value.id
         : createPairId(),
+    savedFindingId:
+      typeof value.savedFindingId === 'string' && value.savedFindingId
+        ? value.savedFindingId
+        : null,
   }
 }
 
@@ -2999,16 +3524,51 @@ type ActiveMarkerOptionVariant = {
   end: number
 }
 
+type FindingNavigationState = {
+  field: FieldName
+  key: string
+}
+
+type NavigationHighlight = {
+  field: FieldName
+  range: TextRange
+}
+
+type SearchBrowserItem =
+  | {
+      folder: FindingFolder
+      hasChildren: boolean
+      isExpanded: boolean
+      key: string
+      level: number
+      type: 'folder'
+    }
+  | {
+      finding: SavedFinding
+      key: string
+      level: number
+      type: 'finding'
+    }
+
+type PendingMarkerOptionSaveAction = {
+  action: 'new' | 'update'
+  markerId: number
+}
+
 function App() {
   const workspaceRef = useRef<HTMLElement>(null)
   const descriptionRef = useRef<HTMLDivElement>(null)
   const conclusionRef = useRef<HTMLDivElement>(null)
+  const startTemplateDescriptionRef = useRef<HTMLDivElement>(null)
+  const startTemplatePendingSelectionRef = useRef<TextRange | null>(null)
   const markerOptionTitleRefs = useRef(new Map<string, HTMLInputElement>())
   const markerOptionValueRefs = useRef(new Map<string, HTMLDivElement>())
   const markerOptionSelectionRef = useRef<MarkerOptionSelection | null>(null)
   const pendingSelectionRef = useRef<PendingSelection | null>(null)
   const lastActiveEditorRef = useRef<FieldName | null>(null)
   const lastDescriptionSelectionRef = useRef<PendingSelection | null>(null)
+  const lastConclusionSelectionRef = useRef<PendingSelection | null>(null)
+  const findingNavigationRef = useRef<FindingNavigationState | null>(null)
   const activeIncompleteFindingRef = useRef<{
     field: FieldName
     range: TextRange
@@ -3061,9 +3621,16 @@ function App() {
   const [hasOpenedProtocol, setHasOpenedProtocol] = useState(false)
   const [isStartCreateDialogOpen, setIsStartCreateDialogOpen] =
     useState(false)
+  const [startTemplateStep, setStartTemplateStep] = useState<1 | 2>(1)
   const [startTemplateDraft, setStartTemplateDraft] = useState(
     createEmptyStartTemplateDraft,
   )
+  const [
+    startTemplateDescriptionContent,
+    setStartTemplateDescriptionContent,
+  ] = useState<EditorSegment[]>(() => createStartTemplateDescriptionContent(''))
+  const [startTemplateActiveMarkerId, setStartTemplateActiveMarkerId] =
+    useState<number | null>(null)
   const [savedFindings, setSavedFindings] = useState<SavedFinding[]>(() =>
     currentUser ? loadStoredFindings(getSavedFindingsStorageKey(currentUser.id)) : [],
   )
@@ -3112,11 +3679,24 @@ function App() {
   const [protocolDirectoryStatus, setProtocolDirectoryStatus] = useState('')
   const [protocolSaveNotice, setProtocolSaveNotice] =
     useState<ProtocolSaveNotice | null>(null)
+  const [protocolDownloadSaveDialog, setProtocolDownloadSaveDialog] =
+    useState<ProtocolDownloadSaveDialogState | null>(null)
   const [findingSearchQuery, setFindingSearchQuery] = useState('')
   const [findingSearchWarning, setFindingSearchWarning] = useState('')
+  const [expandedSearchFolderIds, setExpandedSearchFolderIds] = useState<
+    string[]
+  >([])
+  const [activeSearchBrowserKey, setActiveSearchBrowserKey] = useState<
+    string | null
+  >(null)
   const [findingBrowserWarning, setFindingBrowserWarning] = useState('')
+  const [editorWarning, setEditorWarning] = useState('')
   const [activeMarker, setActiveMarker] = useState<ActiveMarker | null>(null)
   const [markerDialogId, setMarkerDialogId] = useState<number | null>(null)
+  const [
+    pendingMarkerOptionSaveAction,
+    setPendingMarkerOptionSaveAction,
+  ] = useState<PendingMarkerOptionSaveAction | null>(null)
   const [pendingMarkerOptionTitleFocus, setPendingMarkerOptionTitleFocus] =
     useState<{ markerId: number; optionIndex: number } | null>(null)
   const [activeVariant, setActiveVariant] = useState<ActiveVariant | null>(null)
@@ -3124,6 +3704,8 @@ function App() {
     useState<ActiveMarkerOptionVariant | null>(null)
   const [activePairId, setActivePairId] = useState<number | null>(null)
   const [highlightedPairId, setHighlightedPairId] = useState<number | null>(null)
+  const [navigationHighlight, setNavigationHighlight] =
+    useState<NavigationHighlight | null>(null)
   const [activeCursorField, setActiveCursorField] = useState<FieldName | null>(
     null,
   )
@@ -3140,6 +3722,16 @@ function App() {
   const [changedConclusionRanges, setChangedConclusionRanges] = useState<
     TextRange[]
   >([])
+
+  useEffect(() => {
+    if (!editorWarning) {
+      return
+    }
+
+    const timeoutId = window.setTimeout(() => setEditorWarning(''), 2400)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [editorWarning])
 
   const descriptionText = useMemo(
     () => getContentText(descriptionContent),
@@ -3196,6 +3788,64 @@ function App() {
       ).includes(query),
     )
   }, [findingSearchQuery, savedFindings])
+  const findingSearchBrowserItems = useMemo(() => {
+    const expandedIds = new Set(expandedSearchFolderIds)
+    const folderIds = new Set(findingFolders.map((folder) => folder.id))
+    const getNormalizedParentId = (parentId: string | null) =>
+      parentId && folderIds.has(parentId) ? parentId : null
+    const getChildFolders = (parentId: string | null) =>
+      findingFolders.filter(
+        (folder) => getNormalizedParentId(folder.parentId) === parentId,
+      )
+    const getChildFindings = (parentId: string | null) =>
+      savedFindings.filter(
+        (finding) => getNormalizedParentId(finding.folderId) === parentId,
+      )
+    const items: SearchBrowserItem[] = []
+    const addLevel = (parentId: string | null, level: number) => {
+      getChildFolders(parentId).forEach((folder) => {
+        const childFolders = getChildFolders(folder.id)
+        const childFindings = getChildFindings(folder.id)
+        const isExpanded = expandedIds.has(folder.id)
+
+        items.push({
+          folder,
+          hasChildren: Boolean(childFolders.length || childFindings.length),
+          isExpanded,
+          key: `folder:${folder.id}`,
+          level,
+          type: 'folder',
+        })
+
+        if (isExpanded) {
+          addLevel(folder.id, level + 1)
+        }
+      })
+
+      getChildFindings(parentId).forEach((finding) => {
+        items.push({
+          finding,
+          key: `finding:${finding.id}`,
+          level,
+          type: 'finding',
+        })
+      })
+    }
+
+    addLevel(null, 0)
+
+    return items
+  }, [expandedSearchFolderIds, findingFolders, savedFindings])
+  const activeSearchBrowserItem = useMemo(
+    () =>
+      findingSearchBrowserItems.find(
+        (item) => item.key === activeSearchBrowserKey,
+      ) ??
+      findingSearchBrowserItems[0] ??
+      null,
+    [activeSearchBrowserKey, findingSearchBrowserItems],
+  )
+
   const activePair = useMemo(
     () => findingPairs.find((pair) => pair.id === activePairId) ?? null,
     [activePairId, findingPairs],
@@ -3337,13 +3987,14 @@ function App() {
     return getMarkerBlockInfo(descriptionContent, markerMenu.id)
   }, [descriptionContent, markerMenu])
 
-  const markerMenuOptions = useMemo(
+  const markerMenuOptionState = useMemo(
     () =>
       markerMenuSegment
-        ? getMarkerOptionState(markerMenuSegment, markerMenuBlock).options
-        : [],
+        ? getMarkerOptionState(markerMenuSegment, markerMenuBlock)
+        : { defaultOptionIndex: null, options: [], selectedOptionIndex: null },
     [markerMenuBlock, markerMenuSegment],
   )
+  const markerMenuOptions = markerMenuOptionState.options
 
   const markerContextMenuSegment = useMemo(() => {
     if (!markerContextMenu) {
@@ -3385,7 +4036,7 @@ function App() {
             markerContextMenuSegment,
             markerContextMenuBlock,
           )
-        : { options: [], selectedOptionIndex: null },
+        : { defaultOptionIndex: null, options: [], selectedOptionIndex: null },
     [markerContextMenuBlock, markerContextMenuSegment],
   )
   const markerContextMenuSelectedOptionIndex = getResolvedMarkerOptionIndex(
@@ -3402,6 +4053,7 @@ function App() {
     ? getMarkerOptionLabel(
         markerContextMenuSelectedOption,
         markerContextMenuSelectedOptionIndex ?? 0,
+        markerContextMenuBlock,
       )
     : 'Не выбрана'
 
@@ -3430,7 +4082,7 @@ function App() {
     () =>
       markerDialogSegment
         ? getMarkerOptionState(markerDialogSegment, markerDialogBlock)
-        : { options: [], selectedOptionIndex: null },
+        : { defaultOptionIndex: null, options: [], selectedOptionIndex: null },
     [markerDialogBlock, markerDialogSegment],
   )
   const markerDialogOptions = markerDialogOptionState.options
@@ -3453,13 +4105,25 @@ function App() {
 
     if (highlightedPair) {
       highlights.push({
-        ...highlightedPair.description,
+        ...expandRangeToSemanticBlock(descriptionText, highlightedPair.description),
+        className: 'finding-active',
+      })
+    }
+
+    if (navigationHighlight?.field === 'description') {
+      highlights.push({
+        ...expandRangeToSemanticBlock(descriptionText, navigationHighlight.range),
         className: 'finding-active',
       })
     }
 
     return highlights
-  }, [changedDescriptionRanges, descriptionText, highlightedPair])
+  }, [
+    changedDescriptionRanges,
+    descriptionText,
+    highlightedPair,
+    navigationHighlight,
+  ])
 
   const descriptionHtml = useMemo(
     () =>
@@ -3487,23 +4151,57 @@ function App() {
       highlightedPair.conclusion.end > highlightedPair.conclusion.start
     ) {
       highlights.push({
-        ...highlightedPair.conclusion,
+        ...expandRangeToSemanticBlock(conclusionText, highlightedPair.conclusion),
+        className: 'finding-active',
+      })
+    }
+
+    if (navigationHighlight?.field === 'conclusion') {
+      highlights.push({
+        ...expandRangeToSemanticBlock(conclusionText, navigationHighlight.range),
         className: 'finding-active',
       })
     }
 
     return highlights
-  }, [changedConclusionRanges, conclusionText, highlightedPair])
+  }, [
+    changedConclusionRanges,
+    conclusionText,
+    highlightedPair,
+    navigationHighlight,
+  ])
 
   const conclusionHtml = useMemo(
     () => contentToHtml(conclusionContent, conclusionHighlights),
     [conclusionContent, conclusionHighlights],
   )
 
+  const startTemplateDescriptionHtml = useMemo(
+    () =>
+      contentToHtml(
+        startTemplateDescriptionContent,
+        [],
+        startTemplateActiveMarkerId,
+      ),
+    [startTemplateActiveMarkerId, startTemplateDescriptionContent],
+  )
+
+  const startTemplateDescriptionText = useMemo(
+    () => getContentText(startTemplateDescriptionContent),
+    [startTemplateDescriptionContent],
+  )
+
+  const startTemplateSectionMarkers = useMemo(
+    () => getTemplateBuilderSectionMarkers(startTemplateDescriptionContent),
+    [startTemplateDescriptionContent],
+  )
+
   const resetProtocolWorkspace = useCallback(() => {
     pendingSelectionRef.current = null
     lastActiveEditorRef.current = null
     lastDescriptionSelectionRef.current = null
+    lastConclusionSelectionRef.current = null
+    findingNavigationRef.current = null
     activeIncompleteFindingRef.current = null
     setDescriptionContent(ensureLeadingMarkerContent([]))
     setConclusionContent([])
@@ -3519,7 +4217,10 @@ function App() {
     setProtocolSessionCloseId(null)
     setHasOpenedProtocol(false)
     setIsStartCreateDialogOpen(false)
+    setStartTemplateStep(1)
     setStartTemplateDraft(createEmptyStartTemplateDraft())
+    setStartTemplateDescriptionContent(createStartTemplateDescriptionContent(''))
+    setStartTemplateActiveMarkerId(null)
     setFindingSaveDialog(null)
     setIsTemplatesDialogOpen(false)
     setIsFindingSearchOpen(false)
@@ -3537,8 +4238,10 @@ function App() {
     setActiveVariant(null)
     setActivePairId(null)
     setHighlightedPairId(null)
+    setNavigationHighlight(null)
     setActiveCursorField(null)
     setActiveDescriptionFindingRange(null)
+    setEditorWarning('')
     setFindingPairs([])
     setNewDescriptionRanges([])
     setHasLoadedTemplate(false)
@@ -3595,6 +4298,36 @@ function App() {
     descriptionContent,
     conclusionContent,
     highlightedPair,
+  ])
+
+  useLayoutEffect(() => {
+    const pendingSelection = startTemplatePendingSelectionRef.current
+
+    if (
+      !pendingSelection ||
+      !isStartCreateDialogOpen ||
+      startTemplateStep !== 2
+    ) {
+      return
+    }
+
+    const editor = startTemplateDescriptionRef.current
+
+    if (editor) {
+      editor.focus()
+      const safeRange = keepRangeAfterLeadingMarker(
+        startTemplateDescriptionContent,
+        pendingSelection,
+      )
+
+      restoreSelection(editor, safeRange.start, safeRange.end)
+    }
+
+    startTemplatePendingSelectionRef.current = null
+  }, [
+    isStartCreateDialogOpen,
+    startTemplateDescriptionContent,
+    startTemplateStep,
   ])
 
   useLayoutEffect(() => {
@@ -3797,7 +4530,9 @@ function App() {
     const editor = getEditor(field)
     const content = getCurrentContent(field)
 
-    const freshContent = editor ? parseEditorContent(editor, content) : content
+    const freshContent = editor
+      ? ensureSemanticBlockSpacesInContent(parseEditorContent(editor, content))
+      : ensureSemanticBlockSpacesInContent(content)
 
     return field === 'description'
       ? ensureLeadingMarkerContent(freshContent)
@@ -3835,8 +4570,12 @@ function App() {
     ),
     templateName,
     currentTemplateId,
-    descriptionContent: copyContent(getFreshContent('description')),
-    conclusionContent: copyContent(getFreshContent('conclusion')),
+    descriptionContent: copyContent(
+      ensureSemanticBlocksInContent(getFreshContent('description')),
+    ),
+    conclusionContent: copyContent(
+      ensureSemanticBlocksInContent(getFreshContent('conclusion')),
+    ),
     findingPairs: findingPairs.map(copyFindingPair),
     newDescriptionRanges: newDescriptionRanges.map(copyTextRange),
     changedDescriptionRanges: changedDescriptionRanges.map(copyTextRange),
@@ -4045,6 +4784,8 @@ function App() {
     pendingSelectionRef.current = null
     lastActiveEditorRef.current = null
     lastDescriptionSelectionRef.current = null
+    lastConclusionSelectionRef.current = null
+    findingNavigationRef.current = null
     activeIncompleteFindingRef.current = null
     setDescriptionContent(copyContent(normalizedSession.descriptionContent))
     setConclusionContent(copyContent(normalizedSession.conclusionContent))
@@ -4078,6 +4819,7 @@ function App() {
     setActiveVariant(null)
     setActivePairId(null)
     setHighlightedPairId(null)
+    setNavigationHighlight(null)
     setActiveCursorField(null)
     setActiveDescriptionFindingRange(null)
   }
@@ -4163,6 +4905,17 @@ function App() {
   const rememberDescriptionSelection = (selection: TextRange, text: string) => {
     lastDescriptionSelectionRef.current = createPendingSelection(
       'description',
+      {
+        start: selection.end,
+        end: selection.end,
+      },
+      text,
+    )
+  }
+
+  const rememberConclusionSelection = (selection: TextRange, text: string) => {
+    lastConclusionSelectionRef.current = createPendingSelection(
+      'conclusion',
       {
         start: selection.end,
         end: selection.end,
@@ -4328,6 +5081,345 @@ function App() {
     return { pair, description, conclusion }
   }
 
+  const getFindingSavedOrigin = (
+    pair: FindingPair | null | undefined,
+    description: string,
+    conclusion: string,
+  ) => {
+    const linkedFinding = pair?.savedFindingId
+      ? savedFindings.find((finding) => finding.id === pair.savedFindingId) ??
+        null
+      : null
+
+    return (
+      linkedFinding ??
+      findSavedFindingMatch(savedFindings, description, conclusion)
+    )
+  }
+
+  const removeLinkedConclusionsForDescriptionRanges = (
+    content: EditorSegment[],
+    pairs: FindingPair[],
+    descriptionRanges: TextRange[],
+  ) => {
+    if (!descriptionRanges.length) {
+      return { changes: [], content }
+    }
+
+    const text = getContentText(content)
+    const removalRanges = pairs
+      .filter(
+        (pair) =>
+          pair.conclusion.end > pair.conclusion.start &&
+          descriptionRanges.some(
+            (range) => getRangeOverlap(pair.description, range) > 0,
+          ),
+      )
+      .map((pair) => getFindingRemovalRange(text, pair.conclusion))
+
+    return removeTextRangesFromContent(content, removalRanges)
+  }
+
+  const getMarkerOptionDescriptionRemovalRanges = (
+    content: EditorSegment[],
+    blockInfo: NonNullable<ReturnType<typeof getMarkerBlockInfo>>,
+    option: MarkerOption | null | undefined,
+  ) => {
+    if (!option?.findingIds.length) {
+      return []
+    }
+
+    const text = getContentText(content)
+    const remainingIds = new Map<string, number>()
+
+    option.findingIds.forEach((findingId) => {
+      remainingIds.set(findingId, (remainingIds.get(findingId) ?? 0) + 1)
+    })
+
+    return getMarkerFindingRanges(content, blockInfo).flatMap((range) => {
+      const pair =
+        findingPairs.find(
+          (item) => getRangeOverlap(item.description, range) > 0,
+        ) ?? null
+      const savedFindingId = pair?.savedFindingId ?? null
+      const remainingCount = savedFindingId
+        ? remainingIds.get(savedFindingId) ?? 0
+        : 0
+
+      if (!savedFindingId || remainingCount <= 0) {
+        return []
+      }
+
+      remainingIds.set(savedFindingId, remainingCount - 1)
+      return [getFindingRemovalRange(text, range)]
+    })
+  }
+
+  const deleteFindingSummary = (range: TextRange) => {
+    const freshDescriptionContent = getFreshContent('description')
+    const freshDescriptionText = getContentText(freshDescriptionContent)
+    const descriptionRange =
+      getBestOverlappingFindingRange(freshDescriptionText, range) ??
+      clampTextRange(range, freshDescriptionText)
+
+    if (descriptionRange.end <= descriptionRange.start) {
+      return
+    }
+
+    const descriptionRemovalRange = getFindingRemovalRange(
+      freshDescriptionText,
+      descriptionRange,
+    )
+    const pairsToDelete = findingPairs.filter(
+      (item) => getRangeOverlap(item.description, descriptionRemovalRange) > 0,
+    )
+    const descriptionRemoval = removeTextRangesFromContent(
+      freshDescriptionContent,
+      [descriptionRemovalRange],
+    )
+    const freshConclusionContent = getFreshContent('conclusion')
+    const freshConclusionText = getContentText(freshConclusionContent)
+    const conclusionRemovalRanges = pairsToDelete
+      .filter((pair) => pair.conclusion.end > pair.conclusion.start)
+      .map((pair) =>
+        getFindingRemovalRange(freshConclusionText, pair.conclusion),
+      )
+    const conclusionRemoval = removeTextRangesFromContent(
+      freshConclusionContent,
+      conclusionRemovalRanges,
+    )
+    const nextDescriptionText = getContentText(descriptionRemoval.content)
+
+    setDescriptionContent(
+      ensureLeadingMarkerContent(descriptionRemoval.content),
+    )
+    setConclusionContent(conclusionRemoval.content)
+    setFindingPairs((pairs) => {
+      const survivingPairs = pairs.filter(
+        (item) =>
+          getRangeOverlap(item.description, descriptionRemovalRange) === 0,
+      )
+      const conclusionAdjustedPairs = conclusionRemoval.changes.reduce(
+        (nextPairs, change) =>
+          adjustPairsForFieldTextChange(
+            nextPairs,
+            'conclusion',
+            change,
+            null,
+            change.nextText,
+          ),
+        survivingPairs,
+      )
+
+      return descriptionRemoval.changes.reduce(
+        (nextPairs, change) =>
+          adjustPairsForFieldTextChange(
+            nextPairs,
+            'description',
+            change,
+            null,
+            change.nextText,
+          ),
+        conclusionAdjustedPairs,
+      )
+    })
+    setNewDescriptionRanges((ranges) =>
+      descriptionRemoval.changes.reduce(
+        (nextRanges, change) =>
+          adjustTrackedRangesForReplacement(
+            nextRanges,
+            change.previousRange,
+            change.nextRange,
+          ),
+        ranges,
+      ),
+    )
+    setChangedDescriptionRanges((ranges) =>
+      descriptionRemoval.changes.reduce(
+        (nextRanges, change) =>
+          adjustTrackedRangesForReplacement(
+            nextRanges,
+            change.previousRange,
+            change.nextRange,
+          ),
+        ranges,
+      ),
+    )
+    setChangedConclusionRanges((ranges) =>
+      conclusionRemoval.changes.reduce(
+        (nextRanges, change) =>
+          adjustTrackedRangesForReplacement(
+            nextRanges,
+            change.previousRange,
+            change.nextRange,
+          ),
+        ranges,
+      ),
+    )
+
+    const nextCursorOffset = Math.max(
+      0,
+      Math.min(descriptionRemovalRange.start, nextDescriptionText.length),
+    )
+    const nextSelection = createPendingSelection(
+      'description',
+      { start: nextCursorOffset, end: nextCursorOffset },
+      nextDescriptionText,
+      true,
+    )
+
+    pendingSelectionRef.current = nextSelection
+    lastDescriptionSelectionRef.current = nextSelection
+    lastActiveEditorRef.current = 'description'
+    findingNavigationRef.current = null
+    setActiveCursorField('description')
+    setActiveDescriptionFindingRange(null)
+    setActivePairId((current) =>
+      current && pairsToDelete.some((pair) => pair.id === current)
+        ? null
+        : current,
+    )
+    setHighlightedPairId((current) =>
+      current && pairsToDelete.some((pair) => pair.id === current)
+        ? null
+        : current,
+    )
+    setNavigationHighlight(null)
+    setContextMenu(null)
+    setMarkerMenu(null)
+    setMarkerContextMenu(null)
+    setActiveVariant(null)
+    setActiveMarkerOptionVariant(null)
+  }
+
+  const ensureMarkerBlockFindingReferences = (
+    content: EditorSegment[],
+    blockInfo: NonNullable<ReturnType<typeof getMarkerBlockInfo>>,
+  ) => {
+    const ranges = getMarkerFindingRanges(content, blockInfo)
+
+    if (!ranges.length) {
+      return []
+    }
+
+    const freshConclusionContent = getFreshContent('conclusion')
+    const descriptionTextValue = getContentText(content)
+    const conclusionTextValue = getContentText(freshConclusionContent)
+    let nextFindings = savedFindings
+    let hasNewFindings = false
+    const pairLinks = new Map<number, string>()
+    const findingIds: string[] = []
+
+    ranges.forEach((range) => {
+      const pair =
+        findingPairs.find((item) => isSameRange(item.description, range)) ??
+        getBestOverlappingPair(findingPairs, 'description', range)
+      const conclusionRange =
+        pair && pair.conclusion.end > pair.conclusion.start
+          ? getBestOverlappingFindingRange(
+              conclusionTextValue,
+              pair.conclusion,
+            ) ?? pair.conclusion
+          : null
+      const description = getFindingLabelText(
+        getRangeText(descriptionTextValue, range),
+      )
+      const conclusion = conclusionRange
+        ? getFindingLabelText(getRangeText(conclusionTextValue, conclusionRange))
+        : ''
+
+      if (!description && !conclusion) {
+        return
+      }
+
+      const existingFinding = findSavedFindingMatch(
+        nextFindings,
+        description,
+        conclusion,
+      )
+      const savedFindingId = existingFinding?.id ?? createSavedFindingId()
+
+      if (!existingFinding) {
+        const now = getTimestamp()
+
+        nextFindings = [
+          {
+            id: savedFindingId,
+            name: getDefaultFindingName(description, conclusion),
+            description,
+            descriptionContent: sliceContentRange(content, range),
+            conclusion,
+            conclusionContent: conclusionRange
+              ? sliceContentRange(freshConclusionContent, conclusionRange)
+              : [],
+            folderId: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+          ...nextFindings,
+        ]
+        hasNewFindings = true
+      }
+
+      findingIds.push(savedFindingId)
+
+      if (pair) {
+        pairLinks.set(pair.id, savedFindingId)
+      }
+    })
+
+    if (hasNewFindings) {
+      setSavedFindings(nextFindings)
+    }
+
+    if (pairLinks.size) {
+      setFindingPairs((pairs) =>
+        pairs.map((pair) =>
+          pairLinks.has(pair.id)
+            ? { ...pair, savedFindingId: pairLinks.get(pair.id) ?? null }
+            : pair,
+        ),
+      )
+    }
+
+    return findingIds.filter(
+      (findingId, index, ids) => ids.indexOf(findingId) === index,
+    )
+  }
+
+  const getSavedFindingContent = (
+    finding: SavedFinding,
+    field: FieldName,
+  ) => {
+    const storedContent =
+      field === 'description'
+        ? finding.descriptionContent
+        : finding.conclusionContent
+    const fallbackText =
+      field === 'description' ? finding.description : finding.conclusion
+
+    if (storedContent?.length) {
+      return copyContentWithFreshIds(storedContent)
+    }
+
+    return fallbackText.trim() ? [createTextSegment(fallbackText)] : []
+  }
+
+  const getSavedFindingDescriptionInsertContent = (finding: SavedFinding) => {
+    const descriptionContent = getSavedFindingContent(finding, 'description')
+
+    if (getContentText(descriptionContent).trim()) {
+      return descriptionContent
+    }
+
+    return getSavedFindingContent(finding, 'conclusion')
+  }
+
+  const createSemanticFindingContent = (content: EditorSegment[]) =>
+    ensureSemanticBlocksInContent(
+      stripSemanticBlockBracesFromContent(copyContentWithFreshIds(content)),
+    )
+
   const clearHighlightedPairOutsideSelection = (
     field: FieldName,
     selection: TextRange,
@@ -4347,22 +5439,80 @@ function App() {
     }
   }
 
-  const openFindingSaveDialog = (range: TextRange) => {
-    const { description, conclusion } = getFindingSnapshot(range)
-    const existingFinding = findSavedFindingMatch(
-      savedFindings,
-      description,
-      conclusion,
-    )
-    const defaultName =
-      existingFinding?.name ?? getDefaultFindingName(description, conclusion)
+  const clearNavigationHighlightOutsideSelection = (
+    field: FieldName,
+    selection: TextRange,
+  ) => {
+    if (!navigationHighlight) {
+      return
+    }
 
-    setFindingSaveDialog({
-      existingId: existingFinding?.id ?? null,
-      name: defaultName,
-      description,
-      conclusion,
-    })
+    if (
+      navigationHighlight.field !== field ||
+      !isOffsetInRange(navigationHighlight.range, selection.end)
+    ) {
+      findingNavigationRef.current = null
+      setNavigationHighlight(null)
+    }
+  }
+
+  const getFindingNavigationKey = (range: TextRange) =>
+    `${range.start}:${range.end}`
+
+  const focusFindingFromSidebar = (
+    field: FieldName,
+    range: TextRange,
+    text: string,
+  ) => {
+    const cursorOffset = Math.max(
+      0,
+      Math.min(range.start, range.end, text.length),
+    )
+    const cursorRange = { start: cursorOffset, end: cursorOffset }
+
+    pendingSelectionRef.current = createPendingSelection(
+      field,
+      cursorRange,
+      text,
+      true,
+    )
+    lastActiveEditorRef.current = field
+    setActiveCursorField(field)
+
+    if (field === 'description') {
+      rememberDescriptionSelection(cursorRange, text)
+      return
+    }
+
+    rememberConclusionSelection(cursorRange, text)
+  }
+
+  const navigateFindingSummary = (range: TextRange) => {
+    const pair = findPairForDescription(range)
+    const key = getFindingNavigationKey(range)
+    const hasConclusion = Boolean(
+      pair && getFindingLabelText(getRangeText(conclusionText, pair.conclusion)),
+    )
+    const shouldGoToConclusion =
+      findingNavigationRef.current?.key === key &&
+      findingNavigationRef.current.field === 'description' &&
+      hasConclusion
+    const targetField: FieldName = shouldGoToConclusion
+      ? 'conclusion'
+      : 'description'
+    const targetRange =
+      targetField === 'conclusion' && pair ? pair.conclusion : range
+    const targetText =
+      targetField === 'conclusion' ? conclusionText : descriptionText
+
+    focusFindingFromSidebar(targetField, targetRange, targetText)
+    findingNavigationRef.current = { field: targetField, key }
+    setActivePairId(pair?.id ?? null)
+    setHighlightedPairId(pair?.id ?? null)
+    setNavigationHighlight({ field: targetField, range: targetRange })
+    setActiveDescriptionFindingRange(
+      targetField === 'description' ? range : null,
+    )
     setContextMenu(null)
     setMarkerMenu(null)
     setActiveVariant(null)
@@ -4370,6 +5520,39 @@ function App() {
 
   const closeFindingSaveDialog = () => {
     setFindingSaveDialog(null)
+  }
+
+  const linkFindingSaveDialogToSavedFinding = (savedFindingId: string) => {
+    const dialog = findingSaveDialog
+
+    if (!dialog) {
+      return
+    }
+
+    setFindingPairs((pairs) => {
+      const existingIndex = pairs.findIndex(
+        (pair) =>
+          (dialog.pairId !== null && pair.id === dialog.pairId) ||
+          isSameRange(pair.description, dialog.descriptionRange) ||
+          getRangeOverlap(pair.description, dialog.descriptionRange) > 0,
+      )
+
+      if (existingIndex !== -1) {
+        return pairs.map((pair, index) =>
+          index === existingIndex ? { ...pair, savedFindingId } : pair,
+        )
+      }
+
+      return [
+        ...pairs,
+        {
+          id: createPairId(),
+          description: copyTextRange(dialog.descriptionRange),
+          conclusion: { start: 0, end: 0 },
+          savedFindingId,
+        },
+      ]
+    })
   }
 
   const saveExistingFinding = () => {
@@ -4392,13 +5575,18 @@ function App() {
               ...finding,
               name,
               description: findingSaveDialog.description,
+              descriptionContent: copyContent(
+                findingSaveDialog.descriptionContent,
+              ),
               conclusion: findingSaveDialog.conclusion,
+              conclusionContent: copyContent(findingSaveDialog.conclusionContent),
               folderId: finding.folderId,
               updatedAt: now,
             }
           : finding,
       ),
     )
+    linkFindingSaveDialogToSavedFinding(findingSaveDialog.existingId)
     setFindingSaveDialog(null)
   }
 
@@ -4415,30 +5603,131 @@ function App() {
 
     const now = getTimestamp()
 
+    const savedFindingId = createSavedFindingId()
+
     setSavedFindings((findings) => [
       {
-        id: createSavedFindingId(),
+        id: savedFindingId,
         name,
         description: findingSaveDialog.description,
+        descriptionContent: copyContent(findingSaveDialog.descriptionContent),
         conclusion: findingSaveDialog.conclusion,
+        conclusionContent: copyContent(findingSaveDialog.conclusionContent),
         folderId: null,
         createdAt: now,
         updatedAt: now,
       },
       ...findings,
     ])
+    linkFindingSaveDialogToSavedFinding(savedFindingId)
     setFindingSaveDialog(null)
   }
 
   const openFindingSearch = () => {
     setFindingSearchQuery('')
     setFindingSearchWarning('')
+    setExpandedSearchFolderIds([])
+    setActiveSearchBrowserKey(null)
     setIsFindingSearchOpen(true)
     setIsFindingBrowserOpen(false)
     setIsAppMenuOpen(false)
     setContextMenu(null)
     setMarkerMenu(null)
     setActiveVariant(null)
+  }
+
+  const closeFindingSearch = () => {
+    setIsFindingSearchOpen(false)
+    setFindingSearchWarning('')
+  }
+
+  const toggleSearchBrowserFolder = (folderId: string, forceOpen?: boolean) => {
+    setExpandedSearchFolderIds((ids) => {
+      const isExpanded = ids.includes(folderId)
+
+      if (forceOpen === true || !isExpanded) {
+        return isExpanded ? ids : [...ids, folderId]
+      }
+
+      return ids.filter((id) => id !== folderId)
+    })
+    setActiveSearchBrowserKey(`folder:${folderId}`)
+  }
+
+  const activateSearchBrowserItem = (item: SearchBrowserItem | null) => {
+    if (!item) {
+      return
+    }
+
+    setActiveSearchBrowserKey(item.key)
+
+    if (item.type === 'folder') {
+      if (item.hasChildren) {
+        toggleSearchBrowserFolder(item.folder.id)
+      }
+      return
+    }
+
+    insertSavedFindingFromSearch(item.finding)
+  }
+
+  const moveSearchBrowserSelection = (direction: 1 | -1) => {
+    if (!findingSearchBrowserItems.length) {
+      return
+    }
+
+    const currentIndex = Math.max(
+      0,
+      findingSearchBrowserItems.findIndex(
+        (item) => item.key === activeSearchBrowserKey,
+      ),
+    )
+    const nextIndex = clampValue(
+      currentIndex + direction,
+      0,
+      findingSearchBrowserItems.length - 1,
+    )
+
+    setActiveSearchBrowserKey(findingSearchBrowserItems[nextIndex].key)
+  }
+
+  const handleSearchBrowserKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (findingSearchQuery.trim() || !findingSearchBrowserItems.length) {
+      return
+    }
+
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      moveSearchBrowserSelection(1)
+      return
+    }
+
+    if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      moveSearchBrowserSelection(-1)
+      return
+    }
+
+    if (event.key === 'ArrowRight' && activeSearchBrowserItem?.type === 'folder') {
+      event.preventDefault()
+      toggleSearchBrowserFolder(activeSearchBrowserItem.folder.id, true)
+      return
+    }
+
+    if (
+      event.key === 'ArrowLeft' &&
+      activeSearchBrowserItem?.type === 'folder' &&
+      activeSearchBrowserItem.isExpanded
+    ) {
+      event.preventDefault()
+      toggleSearchBrowserFolder(activeSearchBrowserItem.folder.id, false)
+      return
+    }
+
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      activateSearchBrowserItem(activeSearchBrowserItem)
+    }
   }
 
   const openFindingBrowser = () => {
@@ -4540,8 +5829,14 @@ function App() {
 
   const insertSavedFindingFromSearch = (finding: SavedFinding) => {
     const editor = descriptionRef.current
-    const textToInsert = (finding.description || finding.conclusion).trim()
-    const conclusionToInsert = finding.conclusion.trim()
+    const descriptionContentToInsert =
+      getSavedFindingDescriptionInsertContent(finding)
+    const conclusionContentToInsert = getSavedFindingContent(
+      finding,
+      'conclusion',
+    )
+    const textToInsert = getContentText(descriptionContentToInsert).trim()
+    const conclusionToInsert = getContentText(conclusionContentToInsert).trim()
 
     if (
       !editor ||
@@ -4565,32 +5860,60 @@ function App() {
           )
         : lastDescriptionSelectionRef.current
     const resolvedSelection = resolvePendingSelection(text, insertionSelection)
-    const offset = resolvedSelection.end
+    const offset = getOffsetAfterActiveSemanticBlock(
+      text,
+      resolvedSelection.end,
+    )
     const prefix = offset > 0 && !/\s/.test(text[offset - 1]) ? ' ' : ''
-    const suffix = text[offset] && !/\s/.test(text[offset]) ? ' ' : ''
-    const insertedText = `${prefix}${textToInsert}${suffix}`
-    const insertedContent = [createTextSegment(insertedText)]
+    const semanticInsertedContent = createSemanticFindingContent(
+      descriptionContentToInsert,
+    )
+    const semanticInsertedText = getContentText(semanticInsertedContent)
+    const suffix =
+      text[offset] &&
+      !/\s/.test(text[offset]) &&
+      !/\s$/.test(semanticInsertedText)
+        ? ' '
+        : ''
+    const insertedText = `${prefix}${semanticInsertedText}${suffix}`
+    const insertedContent = compactContent([
+      ...(prefix ? [createTextSegment(prefix)] : []),
+      ...semanticInsertedContent,
+      ...(suffix ? [createTextSegment(suffix)] : []),
+    ])
     const nextContent = insertContentAtOffset(content, offset, insertedContent)
     const nextText = getContentText(nextContent)
-    const insertedRange = {
-      start: offset + prefix.length,
-      end: offset + prefix.length + textToInsert.length,
-    }
+    const insertedRange =
+      getBestOverlappingFindingRange(nextText, {
+        start: offset + prefix.length,
+        end: offset + prefix.length + semanticInsertedText.length,
+      }) ?? {
+        start: offset + prefix.length,
+        end: offset + prefix.length + semanticInsertedText.length,
+      }
     const conclusionEditor = conclusionRef.current
     const freshConclusionContent = conclusionEditor
       ? parseEditorContent(conclusionEditor, conclusionContent)
       : conclusionContent
+    const semanticConclusionContent = createSemanticFindingContent(
+      conclusionContentToInsert,
+    )
     const appendConclusionResult = conclusionToInsert
-      ? appendContent(freshConclusionContent, [
-          createTextSegment(conclusionToInsert),
-        ])
+      ? appendContent(freshConclusionContent, semanticConclusionContent)
       : null
+    const appendedConclusionText = appendConclusionResult
+      ? getContentText(appendConclusionResult.content)
+      : ''
     const appendedConclusionRange =
       appendConclusionResult &&
       appendConclusionResult.range.end > appendConclusionResult.range.start
-        ? appendConclusionResult.range
+        ? getBestOverlappingFindingRange(
+            appendedConclusionText,
+            appendConclusionResult.range,
+          ) ?? appendConclusionResult.range
         : null
-    const pairId = appendedConclusionRange ? createPairId() : null
+    const collapsedConclusionOffset = getContentText(freshConclusionContent).length
+    const pairId = createPairId()
 
     setDescriptionContent(ensureLeadingMarkerContent(nextContent))
     if (appendConclusionResult) {
@@ -4606,13 +5929,17 @@ function App() {
         nextText,
       )
 
-      return pairId && appendedConclusionRange
+      return insertedRange.end > insertedRange.start
         ? [
             ...adjustedPairs,
             {
               id: pairId,
               description: insertedRange,
-              conclusion: appendedConclusionRange,
+              conclusion: appendedConclusionRange ?? {
+                start: collapsedConclusionOffset,
+                end: collapsedConclusionOffset,
+              },
+              savedFindingId: finding.id,
             },
           ]
         : adjustedPairs
@@ -4657,6 +5984,10 @@ function App() {
     pendingSelectionRef.current = nextSelection
     lastDescriptionSelectionRef.current = nextSelection
     lastActiveEditorRef.current = 'description'
+    setActivePairId(pairId)
+    setHighlightedPairId(pairId)
+    findingNavigationRef.current = null
+    setNavigationHighlight(null)
     setFindingSearchWarning('')
     setIsFindingSearchOpen(false)
   }
@@ -4704,6 +6035,8 @@ function App() {
         selection,
         currentFieldText,
       )
+    } else {
+      rememberConclusionSelection(selection, currentFieldText)
     }
     setActiveDescriptionFindingRange(
       field === 'description'
@@ -4727,6 +6060,7 @@ function App() {
     }
 
     clearHighlightedPairOutsideSelection(field, selection)
+    clearNavigationHighlightOutsideSelection(field, selection)
 
     const variantId = getVariantIdFromSelection(editor)
     setActiveVariant(variantId ? { field, id: variantId } : null)
@@ -5042,6 +6376,318 @@ function App() {
     setActiveVariant(null)
   }
 
+  const applySemanticBlockContentChange = (
+    field: FieldName,
+    nextContent: EditorSegment[],
+    nextCursorOffset: number,
+  ) => {
+    const previousText =
+      field === 'description' ? descriptionText : conclusionText
+    const normalizedContent =
+      field === 'description' ? ensureLeadingMarkerContent(nextContent) : nextContent
+    const nextText = getContentText(normalizedContent)
+    const change = trackManualTextChange(field, previousText, nextText)
+
+    if (change) {
+      setFindingPairs((pairs) =>
+        adjustPairsForFieldTextChange(
+          pairs,
+          field,
+          change,
+          activePairId,
+          nextText,
+        ),
+      )
+    }
+
+    updateContent(field, () => normalizedContent)
+    pendingSelectionRef.current = createPendingSelection(
+      field,
+      {
+        start: Math.max(0, Math.min(nextCursorOffset, nextText.length)),
+        end: Math.max(0, Math.min(nextCursorOffset, nextText.length)),
+      },
+      nextText,
+      true,
+    )
+    lastActiveEditorRef.current = field
+    setActiveCursorField(field)
+  }
+
+  const handleSemanticBlockKeyDown = (
+    field: FieldName,
+    editor: HTMLElement,
+    event: KeyboardEvent<HTMLDivElement>,
+    isPlainTextKey: boolean,
+  ) => {
+    const selection = getSelectionOffsets(editor)
+
+    if (!selection) {
+      return false
+    }
+
+    const currentContent = parseEditorContent(editor, getCurrentContent(field))
+    const currentText = getContentText(currentContent)
+    const blockAtCursor =
+      selection.start === selection.end
+        ? getSemanticBlockAtOffset(currentText, selection.end)
+        : null
+
+    if (event.key === ' ') {
+      if (
+        blockAtCursor &&
+        selection.end <= blockAtCursor.contentEnd &&
+        currentText[selection.end - 1] === ' '
+      ) {
+        event.preventDefault()
+
+        let nextContent = removeRangeFromContent(
+          currentContent,
+          selection.end - 1,
+          selection.end,
+        )
+        let nextText = getContentText(nextContent)
+        const nextBlock =
+          getSemanticBlockAtOffset(nextText, selection.end - 1) ??
+          getPreviousSemanticBlock(nextText, selection.end - 1)
+
+        if (!nextBlock) {
+          return true
+        }
+
+        let nextCursorOffset: number
+
+        if (nextText[nextBlock.end] !== ' ') {
+          nextContent = insertContentAtOffset(nextContent, nextBlock.end, [
+            createTextSegment(' '),
+          ])
+          nextText = getContentText(nextContent)
+          nextCursorOffset = nextBlock.end + 1
+        } else {
+          nextCursorOffset = nextBlock.end + 1
+        }
+
+        applySemanticBlockContentChange(
+          field,
+          nextContent,
+          Math.min(nextCursorOffset, nextText.length),
+        )
+        return true
+      }
+
+      if (!blockAtCursor) {
+        event.preventDefault()
+        return true
+      }
+
+      return false
+    }
+
+    if (!isPlainTextKey || blockAtCursor) {
+      return false
+    }
+
+    event.preventDefault()
+
+    const insertedText = `${semanticBlockOpen}${event.key}${semanticBlockClose} `
+    const nextContent = replaceRangeWithContent(
+      currentContent,
+      selection.start,
+      selection.end,
+      [createTextSegment(insertedText)],
+    )
+
+    applySemanticBlockContentChange(
+      field,
+      nextContent,
+      selection.start + semanticBlockOpen.length + event.key.length,
+    )
+
+    return true
+  }
+
+  const getSemanticMergeBoundary = (
+    text: string,
+    selection: TextRange,
+    key: string,
+  ) => {
+    const boundaryPattern = /\}\s*\{/g
+    let match = boundaryPattern.exec(text)
+
+    while (match) {
+      const boundary = {
+        start: match.index,
+        end: match.index + match[0].length,
+      }
+
+      if (selection.start === selection.end) {
+        const offset = selection.end
+        const isBackspaceBoundary =
+          key === 'Backspace' && offset > boundary.start && offset <= boundary.end
+        const isDeleteBoundary =
+          key === 'Delete' && offset >= boundary.start && offset < boundary.end
+
+        if (isBackspaceBoundary || isDeleteBoundary) {
+          return boundary
+        }
+      } else if (
+        selection.start >= boundary.start &&
+        selection.end <= boundary.end &&
+        getRangeOverlap(selection, boundary) > 0
+      ) {
+        return boundary
+      }
+
+      match = boundaryPattern.exec(text)
+    }
+
+    return null
+  }
+
+  const handleSemanticBlockBoundaryDelete = (
+    field: FieldName,
+    editor: HTMLElement,
+    event: KeyboardEvent<HTMLDivElement>,
+  ) => {
+    if (event.key !== 'Backspace' && event.key !== 'Delete') {
+      return false
+    }
+
+    const selection = getSelectionOffsets(editor)
+
+    if (!selection) {
+      return false
+    }
+
+    const currentContent = parseEditorContent(editor, getCurrentContent(field))
+    const currentText = getContentText(currentContent)
+    const boundary = getSemanticMergeBoundary(
+      currentText,
+      selection,
+      event.key,
+    )
+
+    if (boundary) {
+      event.preventDefault()
+      applySemanticBlockContentChange(
+        field,
+        replaceRangeWithContent(currentContent, boundary.start, boundary.end, [
+          createTextSegment(' '),
+        ]),
+        boundary.start + 1,
+      )
+      return true
+    }
+
+    if (selection.start !== selection.end) {
+      if (/[{}]/.test(currentText.slice(selection.start, selection.end))) {
+        event.preventDefault()
+
+        let nextContent = removeRangeFromContent(
+          currentContent,
+          selection.start,
+          selection.end,
+        )
+        let nextText = getContentText(nextContent)
+
+        nextContent = hasMalformedSemanticBlockSyntax(nextText)
+          ? ensureSemanticBlocksInContent(
+              stripSemanticBlockBracesFromContent(nextContent),
+            )
+          : ensureSemanticBlockSpacesInContent(nextContent)
+        nextText = getContentText(nextContent)
+
+        applySemanticBlockContentChange(
+          field,
+          nextContent,
+          Math.min(selection.start, nextText.length),
+        )
+        return true
+      }
+
+      return false
+    }
+
+    if (selection.start === selection.end) {
+      const targetIndex =
+        event.key === 'Backspace' ? selection.start - 1 : selection.start
+      const targetChar = currentText[targetIndex]
+
+      if (
+        targetChar === semanticBlockOpen ||
+        targetChar === semanticBlockClose
+      ) {
+        event.preventDefault()
+        return true
+      }
+
+      return false
+    }
+
+    return false
+  }
+
+  const handleSemanticBlockSplit = (
+    field: FieldName,
+    editor: HTMLElement,
+    event: KeyboardEvent<HTMLDivElement>,
+  ) => {
+    if (
+      event.key !== semanticBlockClose ||
+      event.ctrlKey ||
+      event.metaKey ||
+      event.altKey
+    ) {
+      return false
+    }
+
+    const selection = getSelectionOffsets(editor)
+
+    if (!selection || selection.start !== selection.end) {
+      return false
+    }
+
+    const currentContent = parseEditorContent(editor, getCurrentContent(field))
+    const currentText = getContentText(currentContent)
+    const block = getSemanticBlockAtOffset(currentText, selection.end)
+
+    if (!block) {
+      return false
+    }
+
+    const leftText = currentText
+      .slice(block.contentStart, selection.end)
+      .trim()
+    const rightText = currentText
+      .slice(selection.end, block.contentEnd)
+      .trim()
+
+    if (!leftText || !rightText) {
+      event.preventDefault()
+      return true
+    }
+
+    event.preventDefault()
+
+    const replacementText = `${semanticBlockOpen}${leftText}${semanticBlockClose} ${semanticBlockOpen}${rightText}${semanticBlockClose} `
+    const nextContent = replaceRangeWithContent(
+      currentContent,
+      block.start,
+      block.end,
+      [createTextSegment(replacementText)],
+    )
+    const nextCursorOffset =
+      block.start +
+      semanticBlockOpen.length +
+      leftText.length +
+      semanticBlockClose.length +
+      1 +
+      semanticBlockOpen.length
+
+    applySemanticBlockContentChange(field, nextContent, nextCursorOffset)
+    return true
+  }
+
   const getInteractiveItems = () => {
     const fields: FieldName[] = ['description', 'conclusion']
 
@@ -5168,7 +6814,9 @@ function App() {
     const previousText =
       field === 'description' ? descriptionText : conclusionText
     const currentContent = getCurrentContent(field)
-    const parsedEditorContent = parseEditorContent(editor, currentContent)
+    const parsedEditorContent = ensureSemanticBlockSpacesInContent(
+      parseEditorContent(editor, currentContent),
+    )
     const parsedContent =
       field === 'description'
         ? ensureLeadingMarkerContent(parsedEditorContent)
@@ -5187,7 +6835,13 @@ function App() {
         ? Math.max(0, selection.end - textDelta)
         : selection?.end ?? 0
     const textChange = textChanged
-      ? getTextChange(previousText, nextEditorText)
+      ? selection
+        ? getAnchoredInsertionTextChange(
+            previousText,
+            nextEditorText,
+            selection.end,
+          ) ?? getTextChange(previousText, nextEditorText)
+        : getTextChange(previousText, nextEditorText)
       : null
     const nextNewDescriptionRanges =
       field === 'description' && textChange
@@ -5199,6 +6853,8 @@ function App() {
 
     if (field === 'description' && rawSelection) {
       rememberDescriptionSelection(rawSelection, nextEditorText)
+    } else if (field === 'conclusion' && rawSelection) {
+      rememberConclusionSelection(rawSelection, nextEditorText)
     }
 
     const editAnchor = textChange?.previousRange.start ?? editStart
@@ -5267,6 +6923,7 @@ function App() {
       const pairAtCursor = findPairAtOffset(nextPairs, field, selection.end)
       setActivePairId(pairAtCursor?.id ?? null)
       clearHighlightedPairOutsideSelection(field, selection, nextPairs)
+      clearNavigationHighlightOutsideSelection(field, selection)
     }
     setActiveDescriptionFindingRange(
       field === 'description' && nextSelectionOffset !== null
@@ -5356,6 +7013,17 @@ function App() {
     const isPlainTextKey =
       event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey
 
+    if (
+      editor &&
+      handleSemanticBlockBoundaryDelete(field, editor, event)
+    ) {
+      return
+    }
+
+    if (editor && handleSemanticBlockSplit(field, editor, event)) {
+      return
+    }
+
     if (numberToken && editor && event.key === ' ') {
       event.preventDefault()
       insertSpaceAfterNumberToken(field, editor, numberToken)
@@ -5418,6 +7086,14 @@ function App() {
       return
     }
 
+    if (
+      editor &&
+      !currentInteractiveToken &&
+      handleSemanticBlockKeyDown(field, editor, event, isPlainTextKey)
+    ) {
+      return
+    }
+
     if (event.key !== 'Enter') {
       return
     }
@@ -5428,10 +7104,22 @@ function App() {
 
   const handleEditorPaste = (event: ClipboardEvent<HTMLDivElement>) => {
     event.preventDefault()
+    const pastedText = event.clipboardData.getData('text/plain')
+    const selection = getSelectionOffsets(event.currentTarget)
+    const editorText = event.currentTarget.textContent ?? ''
+    const isInsideBlock = selection
+      ? Boolean(getSemanticBlockAtOffset(editorText, selection.end))
+      : false
+    const insertedText = isInsideBlock
+      ? stripSemanticBlockBraces(pastedText)
+      : getContentText(ensureSemanticBlocksInContent([
+          createTextSegment(pastedText),
+        ]))
+
     document.execCommand(
       'insertText',
       false,
-      event.clipboardData.getData('text/plain'),
+      insertedText,
     )
   }
 
@@ -5539,6 +7227,15 @@ function App() {
       return
     }
 
+    if (/[{}]/.test(trimmedSelection.text)) {
+      setEditorWarning('Недопустимый диапазон')
+      setContextMenu(null)
+      setMarkerMenu(null)
+      setActiveMarkerOptionVariant(null)
+      return
+    }
+
+    setEditorWarning('')
     const variant: VariantSegment = {
       id: createSegmentId(),
       type: 'variant',
@@ -5596,10 +7293,85 @@ function App() {
     })
   }
 
+  const getConclusionFindingRangeFromSavedCursor = (
+    content: EditorSegment[],
+  ) => {
+    if (
+      lastActiveEditorRef.current !== 'conclusion' ||
+      !lastConclusionSelectionRef.current
+    ) {
+      return null
+    }
+
+    const text = getContentText(content)
+    const selection = resolvePendingSelection(
+      text,
+      lastConclusionSelectionRef.current,
+    )
+    const range = getFindingRangeAtOffset(text, selection.end)
+
+    return range && isFindingText(text, range) ? { range, selection, text } : null
+  }
+
   const activateFindingCapsule = (range: TextRange) => {
     const { completedConclusionContent, descriptionRange } =
       completeActiveIncompleteFindingForAction(range)
     const pair = findPairForDescription(descriptionRange)
+    const conclusionEditor = getEditor('conclusion')
+    const freshConclusionContent =
+      completedConclusionContent ??
+      (conclusionEditor
+        ? parseEditorContent(conclusionEditor, conclusionContent)
+        : conclusionContent)
+    const conclusionCursorFinding =
+      getConclusionFindingRangeFromSavedCursor(freshConclusionContent)
+
+    if (conclusionCursorFinding) {
+      const existingPairAtConclusion = getBestOverlappingPair(
+        findingPairs,
+        'conclusion',
+        conclusionCursorFinding.range,
+      )
+      const nextPairId =
+        pair?.id ?? existingPairAtConclusion?.id ?? createPairId()
+      const savedFindingId =
+        pair?.savedFindingId ?? existingPairAtConclusion?.savedFindingId ?? null
+
+      setConclusionContent(freshConclusionContent)
+      setFindingPairs((pairs) => {
+        const nextPair: FindingPair = {
+          id: nextPairId,
+          description: descriptionRange,
+          conclusion: conclusionCursorFinding.range,
+          savedFindingId,
+        }
+
+        return [
+          ...pairs.filter(
+            (item) =>
+              item.id !== nextPairId &&
+              !isSameRange(item.description, descriptionRange) &&
+              !isSameRange(item.conclusion, conclusionCursorFinding.range),
+          ),
+          nextPair,
+        ]
+      })
+      setActivePairId(nextPairId)
+      setHighlightedPairId(nextPairId)
+      findingNavigationRef.current = null
+      setNavigationHighlight(null)
+      setContextMenu(null)
+      setMarkerMenu(null)
+      setActiveVariant(null)
+      pendingSelectionRef.current = createPendingSelection(
+        'conclusion',
+        conclusionCursorFinding.selection,
+        conclusionCursorFinding.text,
+        true,
+      )
+      return
+    }
+
     const pairConclusionText = pair
       ? getRangeText(conclusionText, pair.conclusion).trim()
       : ''
@@ -5607,30 +7379,28 @@ function App() {
     if (pair && pairConclusionText) {
       setActivePairId(pair.id)
       setHighlightedPairId(pair.id)
+      findingNavigationRef.current = null
+      setNavigationHighlight(null)
       setContextMenu(null)
       setActiveVariant(null)
       return
     }
 
-    const conclusionEditor = getEditor('conclusion')
-    const freshConclusionContent =
-      completedConclusionContent ??
-      (conclusionEditor
-        ? parseEditorContent(conclusionEditor, conclusionContent)
-        : conclusionContent)
     const freshConclusionText = getContentText(freshConclusionContent)
-    const separator =
-      freshConclusionText && !/\s$/.test(freshConclusionText)
-        ? createTextSegment(' ')
-        : null
-    const insertionStart = freshConclusionText.length + (separator ? 1 : 0)
+    const separatorText =
+      freshConclusionText && !/\s$/.test(freshConclusionText) ? ' ' : ''
+    const insertionStart = freshConclusionText.length + separatorText.length
+    const insertedBlockText = `${separatorText}${semanticBlockOpen}${semanticBlockClose} `
+    const nextConclusionContent = insertContentAtOffset(
+      freshConclusionContent,
+      freshConclusionText.length,
+      [createTextSegment(insertedBlockText)],
+    )
+    const nextConclusionText = getContentText(nextConclusionContent)
+    const nextCursorOffset = insertionStart + semanticBlockOpen.length
     const nextPairId = pair?.id ?? createPairId()
 
-    setConclusionContent(
-      separator
-        ? compactContent([...freshConclusionContent, separator])
-        : freshConclusionContent,
-    )
+    setConclusionContent(nextConclusionContent)
     setFindingPairs((pairs) =>
       pair
         ? pairs.map((item) =>
@@ -5638,7 +7408,10 @@ function App() {
               ? {
                   ...item,
                   description: descriptionRange,
-                  conclusion: { start: insertionStart, end: insertionStart },
+                  conclusion: {
+                    start: nextCursorOffset,
+                    end: nextCursorOffset,
+                  },
                 }
               : item,
           )
@@ -5647,22 +7420,27 @@ function App() {
             {
               id: nextPairId,
               description: descriptionRange,
-              conclusion: { start: insertionStart, end: insertionStart },
+              conclusion: {
+                start: nextCursorOffset,
+                end: nextCursorOffset,
+              },
             },
           ],
     )
     setActivePairId(nextPairId)
     setHighlightedPairId(nextPairId)
+    findingNavigationRef.current = null
+    setNavigationHighlight(null)
     setContextMenu(null)
     setMarkerMenu(null)
     setActiveVariant(null)
     pendingSelectionRef.current = createPendingSelection(
       'conclusion',
       {
-        start: insertionStart,
-        end: insertionStart,
+        start: nextCursorOffset,
+        end: nextCursorOffset,
       },
-      freshConclusionText + (separator ? ' ' : ''),
+      nextConclusionText,
       true,
     )
   }
@@ -6006,48 +7784,117 @@ function App() {
     const text = getContentText(content)
     const selection = editor ? getSelectionOffsets(editor) : null
     const offset = selection?.end ?? text.length
-    const terminalMarkerRange = getTerminalMarkerRange(content)
-    const insertionOffset =
-      terminalMarkerRange && offset >= terminalMarkerRange.start
-        ? terminalMarkerRange.start
-        : offset
-    const marker = createMarkerSegment()
-    const prefix =
-      insertionOffset > 0 && text[insertionOffset - 1] !== '\n' ? '\n' : ''
-    const insertedContent: EditorSegment[] = prefix
-      ? [createTextSegment(prefix), marker]
-      : [marker]
-    const insertedLength = prefix.length + markerText.length
+    const insertion = insertSectionMarkerIntoContent(content, offset)
+    const nextContent = insertion.content
+    const nextText = getContentText(nextContent)
+    const textChange = getTextChange(text, nextText)
+
+    setDescriptionContent(nextContent)
+    if (textChange) {
+      setFindingPairs((pairs) =>
+        adjustPairsForFieldTextChange(
+          pairs,
+          'description',
+          textChange,
+          activePairId,
+          nextText,
+        ),
+      )
+      setNewDescriptionRanges((ranges) =>
+        adjustTrackedRangesForReplacement(
+          ranges,
+          textChange.previousRange,
+          textChange.nextRange,
+        ),
+      )
+      setChangedDescriptionRanges((ranges) =>
+        adjustTrackedRangesForReplacement(
+          ranges,
+          textChange.previousRange,
+          textChange.nextRange,
+        ),
+      )
+    }
+    setActiveMarker({ id: insertion.marker.id })
+    setActiveVariant(null)
+    setContextMenu(null)
+    pendingSelectionRef.current = createPendingSelection(
+      'description',
+      {
+        start: insertion.offset,
+        end: insertion.offset,
+      },
+      nextText,
+      true,
+    )
+  }
+
+  const insertSemanticBlockAfterCursor = () => {
+    const field = lastActiveEditorRef.current ?? 'description'
+    const editor = getEditor(field)
+    const content = getFreshContent(field)
+    const text = getContentText(content)
+    const selection = editor ? getSelectionOffsets(editor) : null
+    const offset = selection?.end ?? text.length
+    const activeBlock = getSemanticBlockAtOffset(text, offset)
+    const insertionOffset = activeBlock?.end ?? offset
+    const needsLeadingSpace =
+      insertionOffset > 0 && text[insertionOffset - 1] !== ' '
+    const insertedText = `${needsLeadingSpace ? ' ' : ''}${semanticBlockOpen}${semanticBlockClose} `
+    const insertedContent = [createTextSegment(insertedText)]
     const nextContent = insertContentAtOffset(
       content,
       insertionOffset,
       insertedContent,
     )
     const nextText = getContentText(nextContent)
-    const nextOffset = insertionOffset + insertedLength
+    const textChange = getTextChange(text, nextText)
+    const nextOffset =
+      insertionOffset +
+      (needsLeadingSpace ? 1 : 0) +
+      semanticBlockOpen.length
 
-    setDescriptionContent(ensureLeadingMarkerContent(nextContent))
-    setFindingPairs((pairs) =>
-      adjustPairsForFieldEdit(
-        pairs,
-        'description',
-        insertionOffset,
-        insertedLength,
-        activePairId,
-        nextText,
-      ),
-    )
-    setNewDescriptionRanges((ranges) =>
-      adjustTrackedRangesForEdit(ranges, insertionOffset, insertedLength),
-    )
-    setChangedDescriptionRanges((ranges) =>
-      adjustTrackedRangesForEdit(ranges, insertionOffset, insertedLength),
-    )
-    setActiveMarker({ id: marker.id })
-    setActiveVariant(null)
-    setContextMenu(null)
+    updateContent(field, () => nextContent)
+
+    if (textChange) {
+      setFindingPairs((pairs) =>
+        adjustPairsForFieldTextChange(
+          pairs,
+          field,
+          textChange,
+          activePairId,
+          nextText,
+        ),
+      )
+
+      if (field === 'description') {
+        setNewDescriptionRanges((ranges) =>
+          adjustTrackedRangesForReplacement(
+            ranges,
+            textChange.previousRange,
+            textChange.nextRange,
+          ),
+        )
+        setChangedDescriptionRanges((ranges) =>
+          adjustTrackedRangesForReplacement(
+            ranges,
+            textChange.previousRange,
+            textChange.nextRange,
+          ),
+        )
+      } else {
+        setChangedConclusionRanges((ranges) =>
+          adjustTrackedRangesForReplacement(
+            ranges,
+            textChange.previousRange,
+            textChange.nextRange,
+          ),
+        )
+      }
+    }
+
     pendingSelectionRef.current = createPendingSelection(
-      'description',
+      field,
       {
         start: nextOffset,
         end: nextOffset,
@@ -6055,6 +7902,11 @@ function App() {
       nextText,
       true,
     )
+    lastActiveEditorRef.current = field
+    setActiveCursorField(field)
+    setActiveVariant(null)
+    setContextMenu(null)
+    setMarkerMenu(null)
   }
 
   const replaceMarkerBlock = (
@@ -6062,27 +7914,51 @@ function App() {
     value: string,
     selectedOptionIndex?: number | null,
     options?: MarkerOption[],
+    defaultOptionIndex?: number | null,
+    sourceContent?: EditorSegment[],
   ) => {
-    const content = descriptionContent
+    const content = sourceContent ?? descriptionContent
     const blockInfo = getMarkerBlockInfo(content, id)
 
     if (!blockInfo) {
       return
     }
 
-    const replacementContent = parseMarkerTemplateContent(value)
-    const replacementText = getContentText(replacementContent)
-    const normalizedReplacementContent =
-      blockInfo.hasNextMarker && !replacementText.endsWith('\n')
-        ? [...replacementContent, createTextSegment('\n')]
-        : replacementContent
-    const normalizedReplacementText = getContentText(
-      normalizedReplacementContent,
+    const markerSegment = content.find(
+      (segment): segment is MarkerSegment =>
+        segment.type === 'marker' && segment.id === id,
     )
-    const nextContent = replaceRangeWithContent(
+    const optionState = markerSegment
+      ? getMarkerOptionState(markerSegment, blockInfo)
+      : { defaultOptionIndex: null, options: [], selectedOptionIndex: null }
+    const previousOptionIndex = getResolvedMarkerOptionIndex(
+      optionState,
+      blockInfo,
+    )
+    const previousOption =
+      previousOptionIndex === null
+        ? null
+        : optionState.options[previousOptionIndex] ?? null
+    const mainReplacementRange = getMarkerMainBlockReplacementRange(
       content,
-      blockInfo.blockStart,
-      blockInfo.blockEnd,
+      blockInfo,
+    )
+    const optionFindingRemovalRanges =
+      getMarkerOptionDescriptionRemovalRanges(content, blockInfo, previousOption)
+    const descriptionRemoval = removeTextRangesFromContent(
+      content,
+      optionFindingRemovalRanges,
+    )
+    const adjustedMainReplacementRange = descriptionRemoval.changes.reduce(
+      (range, change) => mapRangeThroughTextChange(range, change),
+      mainReplacementRange,
+    )
+    const normalizedReplacementContent = parseMarkerTemplateContent(value)
+    const textBeforeReplacement = getContentText(descriptionRemoval.content)
+    const nextContent = replaceRangeWithContent(
+      descriptionRemoval.content,
+      adjustedMainReplacementRange.start,
+      adjustedMainReplacementRange.end,
       normalizedReplacementContent,
     ).map((segment) =>
       segment.type === 'marker' &&
@@ -6090,55 +7966,152 @@ function App() {
       selectedOptionIndex !== undefined
         ? {
             ...segment,
+            defaultOptionIndex:
+              defaultOptionIndex !== undefined
+                ? defaultOptionIndex
+                : segment.defaultOptionIndex,
             options: options ?? segment.options,
             selectedOptionIndex,
           }
         : segment,
     )
     const nextText = getContentText(nextContent)
-    const editDelta =
-      normalizedReplacementText.length -
-      (blockInfo.blockEnd - blockInfo.blockStart)
-    const replacedRange = {
-      start: blockInfo.blockStart,
-      end: blockInfo.blockEnd,
-    }
+    const replacementChange = getTextChange(textBeforeReplacement, nextText)
+    const removedDescriptionRanges = [
+      mainReplacementRange,
+      ...optionFindingRemovalRanges,
+    ]
+    const conclusionCleanup = removeLinkedConclusionsForDescriptionRanges(
+      getFreshContent('conclusion'),
+      findingPairs,
+      removedDescriptionRanges,
+    )
 
     pendingSelectionRef.current = null
     setDescriptionContent(ensureLeadingMarkerContent(nextContent))
-    setNewDescriptionRanges((ranges) =>
-      adjustTrackedRangesForEdit(
-        ranges.filter(
-          (range) => getRangeOverlap(range, replacedRange) === 0,
-        ),
-        blockInfo.blockStart,
-        editDelta,
+    setConclusionContent(conclusionCleanup.content)
+    setChangedConclusionRanges((ranges) =>
+      conclusionCleanup.changes.reduce(
+        (nextRanges, change) =>
+          adjustTrackedRangesForReplacement(
+            nextRanges,
+            change.previousRange,
+            change.nextRange,
+          ),
+        ranges,
       ),
     )
+    setNewDescriptionRanges((ranges) =>
+      (replacementChange
+        ? adjustTrackedRangesForReplacement(
+            descriptionRemoval.changes.reduce(
+              (nextRanges, change) =>
+                adjustTrackedRangesForReplacement(
+                  nextRanges,
+                  change.previousRange,
+                  change.nextRange,
+                ),
+              ranges.filter(
+                (range) =>
+                  !removedDescriptionRanges.some(
+                    (removedRange) =>
+                      getRangeOverlap(range, removedRange) > 0,
+                  ),
+              ),
+            ),
+            replacementChange.previousRange,
+            replacementChange.nextRange,
+          )
+        : descriptionRemoval.changes.reduce(
+            (nextRanges, change) =>
+              adjustTrackedRangesForReplacement(
+                nextRanges,
+                change.previousRange,
+                change.nextRange,
+              ),
+            ranges.filter(
+              (range) =>
+                !removedDescriptionRanges.some(
+                  (removedRange) => getRangeOverlap(range, removedRange) > 0,
+                ),
+            ),
+          ))
+    )
     setChangedDescriptionRanges((ranges) =>
-      adjustTrackedRangesForEdit(
-        ranges.filter(
-          (range) => getRangeOverlap(range, replacedRange) === 0,
-        ),
-        blockInfo.blockStart,
-        editDelta,
-      ),
+      (replacementChange
+        ? adjustTrackedRangesForReplacement(
+            descriptionRemoval.changes.reduce(
+              (nextRanges, change) =>
+                adjustTrackedRangesForReplacement(
+                  nextRanges,
+                  change.previousRange,
+                  change.nextRange,
+                ),
+              ranges.filter(
+                (range) =>
+                  !removedDescriptionRanges.some(
+                    (removedRange) =>
+                      getRangeOverlap(range, removedRange) > 0,
+                  ),
+              ),
+            ),
+            replacementChange.previousRange,
+            replacementChange.nextRange,
+          )
+        : descriptionRemoval.changes.reduce(
+            (nextRanges, change) =>
+              adjustTrackedRangesForReplacement(
+                nextRanges,
+                change.previousRange,
+                change.nextRange,
+              ),
+            ranges.filter(
+              (range) =>
+                !removedDescriptionRanges.some(
+                  (removedRange) => getRangeOverlap(range, removedRange) > 0,
+                ),
+            ),
+          ))
     )
     setFindingPairs((pairs) => {
       const survivingPairs = pairs.filter(
-        (pair) => getRangeOverlap(pair.description, replacedRange) === 0,
+        (pair) =>
+          !removedDescriptionRanges.some(
+            (range) => getRangeOverlap(pair.description, range) > 0,
+          ),
+      )
+      const conclusionAdjustedPairs = conclusionCleanup.changes.reduce(
+        (nextPairs, change) =>
+          adjustPairsForFieldTextChange(
+            nextPairs,
+            'conclusion',
+            change,
+            null,
+            change.nextText,
+          ),
+        survivingPairs,
+      )
+      const removalAdjustedPairs = descriptionRemoval.changes.reduce(
+        (nextPairs, change) =>
+          adjustPairsForFieldTextChange(
+            nextPairs,
+            'description',
+            change,
+            null,
+            change.nextText,
+          ),
+        conclusionAdjustedPairs,
       )
 
-      return editDelta
-        ? adjustPairsForFieldEdit(
-            survivingPairs,
+      return replacementChange
+        ? adjustPairsForFieldTextChange(
+            removalAdjustedPairs,
             'description',
-            blockInfo.blockStart,
-            editDelta,
+            replacementChange,
             null,
             nextText,
           )
-        : survivingPairs
+        : removalAdjustedPairs
     })
   }
 
@@ -6161,9 +8134,17 @@ function App() {
             optionState.selectedOptionIndex < options.length
               ? optionState.selectedOptionIndex
               : null
+          const defaultOptionIndex =
+            optionState.defaultOptionIndex !== null &&
+            optionState.defaultOptionIndex < options.length
+              ? optionState.defaultOptionIndex
+              : blockInfo?.hasNextMarker && options.length
+                ? 0
+                : null
 
           return {
             ...segment,
+            defaultOptionIndex,
             options,
             selectedOptionIndex,
           }
@@ -6190,7 +8171,8 @@ function App() {
 
         if (
           areMarkerOptionsEqual(segment.options, optionState.options) &&
-          segment.selectedOptionIndex === optionState.selectedOptionIndex
+          segment.selectedOptionIndex === optionState.selectedOptionIndex &&
+          segment.defaultOptionIndex === optionState.defaultOptionIndex
         ) {
           return segment
         }
@@ -6198,6 +8180,7 @@ function App() {
         changed = true
         return {
           ...segment,
+          defaultOptionIndex: optionState.defaultOptionIndex,
           options: optionState.options,
           selectedOptionIndex: optionState.selectedOptionIndex,
         }
@@ -6243,6 +8226,49 @@ function App() {
     )
   }
 
+  const removeMarkerOptionFinding = (
+    markerId: number,
+    optionIndex: number,
+    findingId: string,
+  ) => {
+    updateMarkerOptions(markerId, (options) =>
+      options.map((option, index) =>
+        index === optionIndex
+          ? {
+              ...option,
+              findingIds: option.findingIds.filter((id) => id !== findingId),
+            }
+          : option,
+      ),
+    )
+  }
+
+  const makeMarkerOptionDefault = (markerId: number, index: number) => {
+    setDescriptionContent((content) =>
+      ensureLeadingMarkerContent(
+        content.map((segment) => {
+          if (segment.type !== 'marker' || segment.id !== markerId) {
+            return segment
+          }
+
+          const blockInfo = getMarkerBlockInfo(content, markerId)
+          const optionState = getMarkerOptionState(segment, blockInfo)
+
+          if (!blockInfo?.hasNextMarker || !optionState.options[index]) {
+            return segment
+          }
+
+          return {
+            ...segment,
+            defaultOptionIndex: index,
+            options: optionState.options,
+            selectedOptionIndex: optionState.selectedOptionIndex,
+          }
+        }),
+      ),
+    )
+  }
+
   const deleteMarkerOption = (markerId: number, index: number) => {
     setDescriptionContent((content) =>
       ensureLeadingMarkerContent(
@@ -6255,7 +8281,10 @@ function App() {
           const optionState = getMarkerOptionState(segment, blockInfo)
           const optionToDelete = optionState.options[index]
 
-          if (!optionToDelete || !canDeleteMarkerOption(optionToDelete, blockInfo)) {
+          if (
+            !optionToDelete ||
+            !canDeleteMarkerOption(optionToDelete, blockInfo, index)
+          ) {
             return segment
           }
 
@@ -6270,9 +8299,22 @@ function App() {
                 : optionState.selectedOptionIndex > index
                   ? optionState.selectedOptionIndex - 1
                   : optionState.selectedOptionIndex
+          const defaultOptionIndex =
+            optionState.defaultOptionIndex === null
+              ? blockInfo?.hasNextMarker && options.length
+                ? 0
+                : null
+              : optionState.defaultOptionIndex === index
+                ? options.length
+                  ? 0
+                  : null
+                : optionState.defaultOptionIndex > index
+                  ? optionState.defaultOptionIndex - 1
+                  : optionState.defaultOptionIndex
 
           return {
             ...segment,
+            defaultOptionIndex,
             options,
             selectedOptionIndex,
           }
@@ -6552,18 +8594,266 @@ function App() {
       return
     }
 
+    if (option.findingIds.length) {
+      const currentBlockInfo = getMarkerBlockInfo(descriptionContent, markerId)
+
+      if (!currentBlockInfo) {
+        return
+      }
+
+      const previousOptionIndex = getResolvedMarkerOptionIndex(
+        optionState,
+        currentBlockInfo,
+      )
+      const previousOption =
+        previousOptionIndex === null
+          ? null
+          : optionState.options[previousOptionIndex] ?? null
+      const mainReplacementRange = getMarkerMainBlockReplacementRange(
+        descriptionContent,
+        currentBlockInfo,
+      )
+      const optionFindingRemovalRanges =
+        getMarkerOptionDescriptionRemovalRanges(
+          descriptionContent,
+          currentBlockInfo,
+          previousOption,
+        )
+      const descriptionRemoval = removeTextRangesFromContent(
+        descriptionContent,
+        optionFindingRemovalRanges,
+      )
+      const adjustedMainReplacementRange = descriptionRemoval.changes.reduce(
+        (range, change) => mapRangeThroughTextChange(range, change),
+        mainReplacementRange,
+      )
+      let replacementContent = parseMarkerTemplateContent(option.value)
+      let replacementText = getContentText(replacementContent)
+      const insertedFindings: Array<{
+        finding: SavedFinding
+        range: TextRange
+      }> = []
+
+      option.findingIds.forEach((findingId) => {
+        const finding =
+          savedFindings.find((item) => item.id === findingId) ?? null
+        const findingContent = finding
+          ? createSemanticFindingContent(
+              getSavedFindingDescriptionInsertContent(finding),
+            )
+          : []
+        const findingText = getContentText(findingContent)
+
+        if (!finding || !findingText.trim()) {
+          return
+        }
+
+        const separator =
+          replacementText && !/\s$/.test(replacementText)
+            ? [createTextSegment(' ')]
+            : []
+        const start = replacementText.length + getContentText(separator).length
+
+        replacementContent = compactContent([
+          ...replacementContent,
+          ...separator,
+          ...findingContent,
+        ])
+        replacementText = getContentText(replacementContent)
+        insertedFindings.push({
+          finding,
+          range:
+            getBestOverlappingFindingRange(replacementText, {
+              start,
+              end: start + findingText.length,
+            }) ?? { start, end: start + findingText.length },
+        })
+      })
+
+      const normalizedReplacementContent = replacementContent
+      const textBeforeReplacement = getContentText(descriptionRemoval.content)
+      const nextDescriptionContent = replaceRangeWithContent(
+        descriptionRemoval.content,
+        adjustedMainReplacementRange.start,
+        adjustedMainReplacementRange.end,
+        normalizedReplacementContent,
+      ).map((segment) =>
+        segment.type === 'marker' && segment.id === markerId
+          ? {
+              ...segment,
+              defaultOptionIndex: optionState.defaultOptionIndex,
+              options: optionState.options,
+              selectedOptionIndex: index,
+            }
+          : segment,
+      )
+      const nextDescriptionText = getContentText(nextDescriptionContent)
+      const replacementChange = getTextChange(
+        textBeforeReplacement,
+        nextDescriptionText,
+      )
+      const removedDescriptionRanges = [
+        mainReplacementRange,
+        ...optionFindingRemovalRanges,
+      ]
+      const conclusionCleanup = removeLinkedConclusionsForDescriptionRanges(
+        getFreshContent('conclusion'),
+        findingPairs,
+        removedDescriptionRanges,
+      )
+      let nextConclusionContent = conclusionCleanup.content
+      const nextPairs: FindingPair[] = []
+      const adjustTrackedDescriptionRanges = (ranges: TextRange[]) => {
+        const rangesAfterRemoval = descriptionRemoval.changes.reduce(
+          (nextRanges, change) =>
+            adjustTrackedRangesForReplacement(
+              nextRanges,
+              change.previousRange,
+              change.nextRange,
+            ),
+          ranges.filter(
+            (range) =>
+              !removedDescriptionRanges.some(
+                (removedRange) => getRangeOverlap(range, removedRange) > 0,
+              ),
+          ),
+        )
+
+        return replacementChange
+          ? adjustTrackedRangesForReplacement(
+              rangesAfterRemoval,
+              replacementChange.previousRange,
+              replacementChange.nextRange,
+            )
+          : rangesAfterRemoval
+      }
+
+      insertedFindings.forEach(({ finding, range }) => {
+        const conclusionContentToInsert = createSemanticFindingContent(
+          getSavedFindingContent(finding, 'conclusion'),
+        )
+        const conclusionTextToInsert = getContentText(
+          conclusionContentToInsert,
+        )
+        const collapsedConclusionOffset =
+          getContentText(nextConclusionContent).length
+        const appendConclusionResult = conclusionTextToInsert.trim()
+          ? appendContent(nextConclusionContent, conclusionContentToInsert)
+          : null
+
+        if (appendConclusionResult) {
+          nextConclusionContent = appendConclusionResult.content
+        }
+
+        const nextConclusionText = getContentText(nextConclusionContent)
+        const conclusionRange =
+          appendConclusionResult &&
+          appendConclusionResult.range.end > appendConclusionResult.range.start
+            ? getBestOverlappingFindingRange(
+                nextConclusionText,
+                appendConclusionResult.range,
+              ) ?? appendConclusionResult.range
+            : {
+                start: collapsedConclusionOffset,
+                end: collapsedConclusionOffset,
+              }
+
+        nextPairs.push({
+          id: createPairId(),
+          description: {
+            start: adjustedMainReplacementRange.start + range.start,
+            end: adjustedMainReplacementRange.start + range.end,
+          },
+          conclusion: conclusionRange,
+          savedFindingId: finding.id,
+        })
+      })
+
+      setDescriptionContent(ensureLeadingMarkerContent(nextDescriptionContent))
+      setConclusionContent(nextConclusionContent)
+      setFindingPairs((pairs) => {
+        const survivingPairs = pairs.filter(
+          (pair) =>
+            !removedDescriptionRanges.some(
+              (range) => getRangeOverlap(pair.description, range) > 0,
+            ),
+        )
+        const conclusionAdjustedPairs = conclusionCleanup.changes.reduce(
+          (adjustedPairs, change) =>
+            adjustPairsForFieldTextChange(
+              adjustedPairs,
+              'conclusion',
+              change,
+              null,
+              change.nextText,
+          ),
+          survivingPairs,
+        )
+        const removalAdjustedPairs = descriptionRemoval.changes.reduce(
+          (adjustedPairs, change) =>
+            adjustPairsForFieldTextChange(
+              adjustedPairs,
+              'description',
+              change,
+              null,
+              change.nextText,
+            ),
+          conclusionAdjustedPairs,
+        )
+        const adjustedPairs = replacementChange
+          ? adjustPairsForFieldTextChange(
+              removalAdjustedPairs,
+              'description',
+              replacementChange,
+              null,
+              nextDescriptionText,
+            )
+          : removalAdjustedPairs
+
+        return [...adjustedPairs, ...nextPairs]
+      })
+      setNewDescriptionRanges((ranges) =>
+        mergeTextRanges([
+          ...adjustTrackedDescriptionRanges(ranges),
+          ...nextPairs.map((pair) => pair.description),
+        ]),
+      )
+      setChangedDescriptionRanges((ranges) =>
+        adjustTrackedDescriptionRanges(ranges),
+      )
+      setChangedConclusionRanges((ranges) => {
+        return conclusionCleanup.changes.reduce(
+          (nextRanges, change) =>
+            adjustTrackedRangesForReplacement(
+              nextRanges,
+              change.previousRange,
+              change.nextRange,
+          ),
+          ranges,
+        )
+      })
+      setActiveMarker({ id: markerId })
+      setMarkerMenu(null)
+      setMarkerContextMenu(null)
+      return
+    }
+
     replaceMarkerBlock(
       markerId,
       option.value,
       index,
       optionState.options,
+      optionState.defaultOptionIndex,
     )
     setActiveMarker({ id: markerId })
     setMarkerMenu(null)
     setMarkerContextMenu(null)
   }
 
-  const updateSelectedMarkerOptionFromBlock = (markerId: number) => {
+  const updateSelectedMarkerOptionFromBlock = (
+    markerId: number,
+    includeFindings = false,
+  ) => {
     const content = getFreshContent('description')
     const markerSegment = content.find(
       (segment): segment is MarkerSegment =>
@@ -6585,9 +8875,16 @@ function App() {
       return
     }
 
+    const normalizedValue = getSingleSemanticBlockMarkerOptionValue(
+      content,
+      blockInfo,
+    )
+    const findingIds = includeFindings
+      ? ensureMarkerBlockFindingReferences(content, blockInfo)
+      : []
     const nextOptions = optionState.options.map((option, optionIndex) =>
       optionIndex === selectedOptionIndex
-        ? { ...option, value: blockInfo.value }
+        ? { ...option, findingIds, value: normalizedValue }
         : option,
     )
     const nextContent = ensureLeadingMarkerContent(
@@ -6595,6 +8892,7 @@ function App() {
         segment.type === 'marker' && segment.id === markerId
           ? {
               ...segment,
+              defaultOptionIndex: optionState.defaultOptionIndex,
               options: nextOptions,
               selectedOptionIndex,
             }
@@ -6607,7 +8905,10 @@ function App() {
     setMarkerContextMenu(null)
   }
 
-  const saveMarkerBlockAsNewOption = (markerId: number) => {
+  const saveMarkerBlockAsNewOption = (
+    markerId: number,
+    includeFindings = false,
+  ) => {
     const content = getFreshContent('description')
     const markerSegment = content.find(
       (segment): segment is MarkerSegment =>
@@ -6621,11 +8922,19 @@ function App() {
 
     const optionState = getMarkerOptionState(markerSegment, blockInfo)
     const newOptionIndex = optionState.options.length
+    const normalizedValue = getSingleSemanticBlockMarkerOptionValue(
+      content,
+      blockInfo,
+    )
+    const findingIds = includeFindings
+      ? ensureMarkerBlockFindingReferences(content, blockInfo)
+      : []
     const nextOptions = [
       ...optionState.options,
       {
+        findingIds,
         title: 'Новая заготовка',
-        value: blockInfo.value,
+        value: normalizedValue,
       },
     ]
     const nextContent = ensureLeadingMarkerContent(
@@ -6633,6 +8942,7 @@ function App() {
         segment.type === 'marker' && segment.id === markerId
           ? {
               ...segment,
+              defaultOptionIndex: optionState.defaultOptionIndex,
               options: nextOptions,
               selectedOptionIndex: newOptionIndex,
             }
@@ -6654,6 +8964,33 @@ function App() {
     setActiveMarkerOptionVariant(null)
   }
 
+  const requestMarkerOptionSave = (
+    markerId: number,
+    action: PendingMarkerOptionSaveAction['action'],
+  ) => {
+    setPendingMarkerOptionSaveAction({ action, markerId })
+    setMarkerContextMenu(null)
+  }
+
+  const completePendingMarkerOptionSave = (includeFindings: boolean) => {
+    const pendingAction = pendingMarkerOptionSaveAction
+
+    if (!pendingAction) {
+      return
+    }
+
+    if (pendingAction.action === 'update') {
+      updateSelectedMarkerOptionFromBlock(
+        pendingAction.markerId,
+        includeFindings,
+      )
+    } else {
+      saveMarkerBlockAsNewOption(pendingAction.markerId, includeFindings)
+    }
+
+    setPendingMarkerOptionSaveAction(null)
+  }
+
   const saveProtocolTemplate = (nameValue = templateName, templateId?: string) => {
     const name = nameValue.trim()
 
@@ -6666,8 +9003,12 @@ function App() {
       ? templates.find((template) => template.id === templateId) ?? null
       : null
     const nextTemplateId = templateToUpdate?.id ?? createTemplateId()
-    const freshDescriptionContent = getFreshContent('description')
-    const freshConclusionContent = getFreshContent('conclusion')
+    const freshDescriptionContent = ensureSemanticBlocksInContent(
+      getFreshContent('description'),
+    )
+    const freshConclusionContent = ensureSemanticBlocksInContent(
+      getFreshContent('conclusion'),
+    )
 
     setTemplates((currentTemplates) => {
       const existingTemplate = templateId
@@ -6739,6 +9080,8 @@ function App() {
     pendingSelectionRef.current = null
     lastActiveEditorRef.current = null
     lastDescriptionSelectionRef.current = null
+    lastConclusionSelectionRef.current = null
+    findingNavigationRef.current = null
     activeIncompleteFindingRef.current = null
     setDescriptionContent(loadedDescriptionContent)
     setConclusionContent(loadedConclusionContent)
@@ -6768,6 +9111,7 @@ function App() {
     setActiveVariant(null)
     setActivePairId(null)
     setHighlightedPairId(null)
+    setNavigationHighlight(null)
     setActiveCursorField(null)
     setActiveDescriptionFindingRange(null)
   }
@@ -6777,6 +9121,8 @@ function App() {
     pendingSelectionRef.current = null
     lastActiveEditorRef.current = null
     lastDescriptionSelectionRef.current = null
+    lastConclusionSelectionRef.current = null
+    findingNavigationRef.current = null
     activeIncompleteFindingRef.current = null
     setHasOpenedProtocol(false)
     setIsStartCreateDialogOpen(false)
@@ -6795,6 +9141,7 @@ function App() {
     setActiveVariant(null)
     setActivePairId(null)
     setHighlightedPairId(null)
+    setNavigationHighlight(null)
   }
 
   const deleteProtocolTemplate = (id: string) => {
@@ -6821,7 +9168,972 @@ function App() {
     setProtocolSaveNotice(null)
   }
 
+  const getMarkerSectionTitle = (
+    marker: MarkerSegment | null | undefined,
+    fallback = 'Раздел',
+  ) => marker?.title.trim() || fallback
+
+  const getMarkerSectionTitleInContent = (
+    content: EditorSegment[],
+    markerId: number | null,
+    fallback = 'Находки',
+  ) => {
+    if (markerId === null) {
+      return fallback
+    }
+
+    const markerEntry =
+      getSectionStructureMarkerEntries(content).find(
+        (entry) => entry.id === markerId,
+      ) ?? null
+
+    if (markerEntry) {
+      return getMarkerSectionTitle(
+        markerEntry.segment,
+        `Раздел ${markerEntry.number}`,
+      )
+    }
+
+    const marker =
+      content.find(
+        (segment): segment is MarkerSegment =>
+          segment.type === 'marker' && segment.id === markerId,
+      ) ?? null
+
+    return getMarkerSectionTitle(marker, fallback)
+  }
+
+  const getSectionInfoForDescriptionRange = (
+    content: EditorSegment[],
+    range: TextRange,
+  ) => {
+    const markerId = getMarkerIdAtOffset(content, range.start)
+
+    return {
+      isSectionGroup: markerId !== null,
+      markerId,
+      title: getMarkerSectionTitleInContent(content, markerId),
+    }
+  }
+
+  const getSectionFolderNameForDescriptionRange = (
+    content: EditorSegment[],
+    range: TextRange,
+  ) => {
+    const markerId = getMarkerIdAtOffset(content, range.start)
+    const marker =
+      markerId === null
+        ? null
+        : content.find(
+            (segment): segment is MarkerSegment =>
+              segment.type === 'marker' && segment.id === markerId,
+          ) ?? null
+    const title = normalizeFindingFolderName(marker?.title ?? '')
+
+    return title || null
+  }
+
+  const collectProtocolDownloadSaveItems = () => {
+    const freshDescriptionContent = getFreshContent('description')
+    const freshConclusionContent = getFreshContent('conclusion')
+    const freshDescriptionText = getContentText(freshDescriptionContent)
+    const freshConclusionText = getContentText(freshConclusionContent)
+    const currentTemplate =
+      currentTemplateId === null
+        ? null
+        : templates.find((template) => template.id === currentTemplateId) ??
+          null
+    const items: ProtocolDownloadSaveItem[] = []
+    const sectionStructureChanges = currentTemplate
+      ? getSectionStructureChanges(
+          currentTemplate.descriptionContent,
+          freshDescriptionContent,
+        )
+      : null
+
+    if (sectionStructureChanges) {
+      items.push({
+        ...sectionStructureChanges,
+        checked: true,
+        descriptionContent: copyContent(freshDescriptionContent),
+        detail: formatSectionStructureChangeDetail(sectionStructureChanges),
+        id: 'section-structure',
+        isSectionGroup: false,
+        kind: 'section-structure',
+        label: 'Сохранить структуру разделов в шаблон',
+        sectionTitle: 'Изменения разделов',
+      })
+    }
+
+    freshDescriptionContent.forEach((segment) => {
+      if (segment.type !== 'marker') {
+        return
+      }
+
+      const blockInfo = getMarkerBlockInfo(freshDescriptionContent, segment.id)
+
+      if (!blockInfo?.hasNextMarker) {
+        return
+      }
+
+      const sectionTitle = getMarkerSectionTitleInContent(
+        freshDescriptionContent,
+        segment.id,
+      )
+      const rawOptionState = getMarkerOptionState(segment, blockInfo)
+      const optionState = normalizeMarkerOptionStateForSectionSave(
+        freshDescriptionContent,
+        blockInfo,
+        rawOptionState,
+      )
+      const selectedOptionIndex = getResolvedMarkerOptionIndex(
+        optionState,
+        blockInfo,
+      )
+      const templateMarker =
+        currentTemplate?.descriptionContent.find(
+          (templateSegment): templateSegment is MarkerSegment =>
+            templateSegment.type === 'marker' && templateSegment.id === segment.id,
+        ) ?? null
+      const templateBlockInfo =
+        currentTemplate && templateMarker
+          ? getMarkerBlockInfo(currentTemplate.descriptionContent, segment.id)
+          : null
+      const templateOptionState =
+        currentTemplate && templateMarker && templateBlockInfo
+          ? normalizeMarkerOptionStateForSectionSave(
+              currentTemplate.descriptionContent,
+              templateBlockInfo,
+              getMarkerOptionState(templateMarker, templateBlockInfo),
+            )
+          : null
+
+      if (selectedOptionIndex !== null) {
+        const selectedOption = optionState.options[selectedOptionIndex] ?? null
+        const baselineOption =
+          templateOptionState?.options[selectedOptionIndex] ?? selectedOption
+        const currentValue = getSingleSemanticBlockMarkerOptionValue(
+          freshDescriptionContent,
+          blockInfo,
+        )
+
+        if (
+          selectedOption &&
+          baselineOption &&
+          getMarkerOptionComparableValue(currentValue) !==
+            getMarkerOptionComparableValue(baselineOption.value)
+        ) {
+          const valueRange = getMarkerBlockValueRange(
+            freshDescriptionContent,
+            blockInfo,
+          )
+          const selectedOptionLabel = getMarkerOptionLabel(
+            selectedOption,
+            selectedOptionIndex,
+            blockInfo,
+          )
+
+          items.push({
+            checked: true,
+            detail:
+              getProtocolSavePreviewText(currentValue) ||
+              'Текст раздела пустой',
+            id: `section-current:${segment.id}:${selectedOptionIndex}`,
+            includeFindings: true,
+            isSectionGroup: true,
+            kind: 'section-current',
+            label: `Обновить заготовку «${selectedOptionLabel}»`,
+            markerId: segment.id,
+            newOptionLabel: '',
+            optionIndex: selectedOptionIndex,
+            optionLabel: selectedOptionLabel,
+            previousValue: baselineOption.value,
+            range: valueRange,
+            saveMode: 'update',
+            sectionTitle,
+            value: currentValue,
+          })
+        }
+      }
+
+      if (!templateOptionState) {
+        return
+      }
+
+      optionState.options.forEach((option, optionIndex) => {
+        const templateOption = templateOptionState.options[optionIndex] ?? null
+        const hasVariantChange = hasMarkerOptionVariantChange(
+          option.value,
+          templateOption?.value ?? '',
+        )
+        const duplicatesSelectedTextChange =
+          optionIndex === selectedOptionIndex &&
+          !hasVariantChange &&
+          areMarkerOptionTitlesAndFindingsEqual(option, templateOption) &&
+          getMarkerOptionComparableValue(option.value) !==
+            getMarkerOptionComparableValue(templateOption?.value ?? '') &&
+          getMarkerOptionComparableValue(option.value) ===
+            getMarkerOptionComparableValue(
+              getSingleSemanticBlockMarkerOptionValue(
+                freshDescriptionContent,
+                blockInfo,
+              ),
+            )
+
+        if (duplicatesSelectedTextChange) {
+          return
+        }
+
+        if (areMarkerOptionsSavedEqual(option, templateOption)) {
+          return
+        }
+
+        const optionLabel = getMarkerOptionLabel(option, optionIndex, blockInfo)
+        const previousOptionLabel = templateOption
+          ? getMarkerOptionLabel(templateOption, optionIndex, blockInfo)
+          : null
+
+        items.push({
+          checked: true,
+          detail:
+            getProtocolSavePreviewText(option.value) ||
+            'Заготовка без текста',
+          id: `section-option:${segment.id}:${optionIndex}`,
+          includeFindings: true,
+          isSectionGroup: true,
+          kind: 'section-option',
+          label: templateOption
+            ? `Сохранить изменения заготовки «${optionLabel}»`
+            : `Сохранить новую заготовку «${optionLabel}»`,
+          isNewOption: !templateOption,
+          markerId: segment.id,
+          newOptionLabel: '',
+          option: copyMarkerOption(option),
+          optionIndex,
+          optionLabel,
+          previousFindingIds: templateOption ? [...templateOption.findingIds] : [],
+          previousOptionLabel,
+          previousValue: templateOption?.value ?? '',
+          saveMode: 'update',
+          sectionTitle,
+          value: option.value,
+        })
+      })
+    })
+
+    completedDescriptionFindingRanges.forEach((range, index) => {
+      const pair = findPairForDescription(range)
+      const description = getFindingLabelText(
+        getRangeText(freshDescriptionText, range),
+      )
+      const conclusionRange =
+        pair && pair.conclusion.end > pair.conclusion.start
+          ? getBestOverlappingFindingRange(
+              freshConclusionText,
+              pair.conclusion,
+            ) ?? pair.conclusion
+          : null
+      const conclusion = conclusionRange
+        ? getFindingLabelText(getRangeText(freshConclusionText, conclusionRange))
+        : ''
+      const linkedFinding =
+        pair?.savedFindingId
+          ? savedFindings.find((finding) => finding.id === pair.savedFindingId) ??
+            null
+          : null
+      const savedOrigin =
+        linkedFinding ?? findSavedFindingMatch(savedFindings, description, conclusion)
+      const isLinkedFindingChanged =
+        Boolean(linkedFinding) &&
+        (normalizeSavedFindingText(linkedFinding?.description ?? '') !==
+          normalizeSavedFindingText(description) ||
+          normalizeSavedFindingText(linkedFinding?.conclusion ?? '') !==
+            normalizeSavedFindingText(conclusion))
+      const shouldTreatAsFinding =
+        isAdditionalMarkerFindingRange(freshDescriptionContent, range) ||
+        isLinkedFindingChanged
+
+      if (!shouldTreatAsFinding) {
+        return
+      }
+
+      if (savedOrigin && !isLinkedFindingChanged) {
+        return
+      }
+
+      const name =
+        linkedFinding?.name ?? getDefaultFindingName(description, conclusion)
+      const sectionInfo = getSectionInfoForDescriptionRange(
+        freshDescriptionContent,
+        range,
+      )
+      const sectionFolderName = getSectionFolderNameForDescriptionRange(
+        freshDescriptionContent,
+        range,
+      )
+      const sectionFolder = getRootFindingFolderByName(
+        findingFolders,
+        sectionFolderName,
+      )
+
+      items.push({
+        checked: true,
+        conclusion,
+        conclusionContent: conclusionRange
+          ? sliceContentRange(freshConclusionContent, conclusionRange)
+          : [],
+        conclusionRange: conclusionRange ? copyTextRange(conclusionRange) : null,
+        description,
+        descriptionContent: sliceContentRange(freshDescriptionContent, range),
+        descriptionRange: copyTextRange(range),
+        detail: conclusion
+          ? `${description} → ${conclusion}`
+          : description || 'Описание пустое',
+        id: `finding:${pair?.id ?? 'new'}:${range.start}:${range.end}:${index}`,
+        folderId: sectionFolder?.id ?? null,
+        folderName: sectionFolder ? null : sectionFolderName,
+        isSectionGroup: sectionInfo.isSectionGroup,
+        kind: linkedFinding ? 'finding-update' : 'finding-new',
+        label: linkedFinding
+          ? `Обновить находку «${name}»`
+          : `Сохранить находку «${name}»`,
+        markerId: sectionInfo.markerId,
+        name,
+        pairId: pair?.id ?? null,
+        savedFindingId: linkedFinding?.id ?? null,
+        sectionTitle: sectionInfo.title,
+        suggestedFolderName: sectionFolderName,
+      })
+    })
+
+    const sectionFindingItems = items.filter(
+      (item): item is ProtocolDownloadFindingSaveItem =>
+        (item.kind === 'finding-new' || item.kind === 'finding-update') &&
+        item.isSectionGroup &&
+        item.markerId !== null,
+    )
+
+    freshDescriptionContent.forEach((segment) => {
+      if (
+        segment.type !== 'marker' ||
+        !currentTemplate ||
+        !sectionFindingItems.some((item) => item.markerId === segment.id) ||
+        items.some(
+          (item) =>
+            (item.kind === 'section-current' ||
+              item.kind === 'section-option') &&
+            item.markerId === segment.id,
+        )
+      ) {
+        return
+      }
+
+      const blockInfo = getMarkerBlockInfo(freshDescriptionContent, segment.id)
+      const optionState = getMarkerOptionState(segment, blockInfo)
+      const selectedOptionIndex = getResolvedMarkerOptionIndex(
+        optionState,
+        blockInfo,
+      )
+
+      if (selectedOptionIndex === null) {
+        return
+      }
+
+      const selectedOption = optionState.options[selectedOptionIndex] ?? null
+
+      if (!selectedOption) {
+        return
+      }
+
+      const sectionTitle = getMarkerSectionTitleInContent(
+        freshDescriptionContent,
+        segment.id,
+      )
+      const optionLabel = getMarkerOptionLabel(
+        selectedOption,
+        selectedOptionIndex,
+        blockInfo,
+      )
+
+      items.push({
+        checked: true,
+        detail: 'Добавить отмеченные находки в заготовку',
+        id: `section-findings:${segment.id}:${selectedOptionIndex}`,
+        includeFindings: true,
+        isFindingReferenceOnly: true,
+        isNewOption: false,
+        isSectionGroup: true,
+        kind: 'section-option',
+        label: `Обновить находки заготовки «${optionLabel}»`,
+        markerId: segment.id,
+        newOptionLabel: '',
+        option: copyMarkerOption(selectedOption),
+        optionIndex: selectedOptionIndex,
+        optionLabel,
+        previousFindingIds: [...selectedOption.findingIds],
+        previousOptionLabel: optionLabel,
+        previousValue: selectedOption.value,
+        saveMode: 'update',
+        sectionTitle,
+        value: selectedOption.value,
+      })
+    })
+
+    return items
+  }
+
+  const updateProtocolDownloadSaveItem = (id: string, checked: boolean) => {
+    setProtocolDownloadSaveDialog((dialog) =>
+      dialog
+        ? {
+            ...dialog,
+            items: dialog.items.map((item) =>
+              item.id === id ? { ...item, checked } : item,
+            ),
+          }
+        : dialog,
+    )
+  }
+
+  const updateProtocolDownloadSectionIncludeFindings = (
+    markerId: number,
+    includeFindings: boolean,
+  ) => {
+    setProtocolDownloadSaveDialog((dialog) =>
+      dialog
+        ? {
+            ...dialog,
+            items: dialog.items.map((item) =>
+              (item.kind === 'section-current' ||
+                item.kind === 'section-option') &&
+              item.markerId === markerId
+                ? { ...item, includeFindings }
+                : item,
+            ),
+          }
+        : dialog,
+    )
+  }
+
+  const updateProtocolDownloadFindingMode = (
+    id: string,
+    mode: 'new' | 'update',
+  ) => {
+    setProtocolDownloadSaveDialog((dialog) =>
+      dialog
+        ? {
+            ...dialog,
+            items: dialog.items.map((item) => {
+              if (
+                item.id !== id ||
+                (item.kind !== 'finding-new' && item.kind !== 'finding-update')
+              ) {
+                return item
+              }
+
+              if (mode === 'update') {
+                if (!item.savedFindingId) {
+                  return item
+                }
+
+                const savedFinding =
+                  savedFindings.find(
+                    (finding) => finding.id === item.savedFindingId,
+                  ) ?? null
+
+                return {
+                  ...item,
+                  kind: 'finding-update',
+                  name: savedFinding?.name ?? item.name,
+                }
+              }
+
+              return {
+                ...item,
+                kind: 'finding-new',
+              }
+            }),
+          }
+        : dialog,
+    )
+  }
+
+  const updateProtocolDownloadFindingName = (id: string, name: string) => {
+    setProtocolDownloadSaveDialog((dialog) =>
+      dialog
+        ? {
+            ...dialog,
+            items: dialog.items.map((item) =>
+              item.id === id &&
+              (item.kind === 'finding-new' || item.kind === 'finding-update')
+                ? { ...item, name }
+                : item,
+            ),
+          }
+        : dialog,
+    )
+  }
+
+  const updateProtocolDownloadFindingFolder = (id: string, value: string) => {
+    setProtocolDownloadSaveDialog((dialog) =>
+      dialog
+        ? {
+            ...dialog,
+            items: dialog.items.map((item) => {
+              if (
+                item.id !== id ||
+                (item.kind !== 'finding-new' && item.kind !== 'finding-update')
+              ) {
+                return item
+              }
+
+              if (value === findingFolderRootSelectValue) {
+                return { ...item, folderId: null, folderName: null }
+              }
+
+              if (value.startsWith(findingFolderSelectPrefix)) {
+                return {
+                  ...item,
+                  folderId: value.slice(findingFolderSelectPrefix.length),
+                  folderName: null,
+                }
+              }
+
+              if (value.startsWith(findingFolderCreateSelectPrefix)) {
+                const folderName = normalizeFindingFolderName(
+                  value.slice(findingFolderCreateSelectPrefix.length),
+                )
+
+                return {
+                  ...item,
+                  folderId: null,
+                  folderName: folderName || null,
+                }
+              }
+
+              return item
+            }),
+          }
+        : dialog,
+    )
+  }
+
+  const updateProtocolDownloadSectionSaveMode = (
+    markerId: number,
+    mode: ProtocolDownloadSectionSaveMode,
+  ) => {
+    setProtocolDownloadSaveDialog((dialog) =>
+      dialog
+        ? {
+            ...dialog,
+            items: dialog.items.map((item) =>
+              (item.kind === 'section-current' ||
+                item.kind === 'section-option') &&
+              item.markerId === markerId
+                ? { ...item, saveMode: mode }
+                : item,
+            ),
+          }
+        : dialog,
+    )
+  }
+
+  const updateProtocolDownloadSectionNewOptionLabel = (
+    markerId: number,
+    newOptionLabel: string,
+  ) => {
+    setProtocolDownloadSaveDialog((dialog) =>
+      dialog
+        ? {
+            ...dialog,
+            items: dialog.items.map((item) =>
+              (item.kind === 'section-current' ||
+                item.kind === 'section-option') &&
+              item.markerId === markerId
+                ? { ...item, newOptionLabel }
+                : item,
+            ),
+          }
+        : dialog,
+    )
+  }
+
+  const closeProtocolDownloadSaveDialog = () => {
+    setProtocolDownloadSaveDialog(null)
+  }
+
+  const applySectionDownloadSaveItems = (
+    content: EditorSegment[],
+    items: Array<
+      | ProtocolDownloadSectionCurrentSaveItem
+      | ProtocolDownloadSectionOptionSaveItem
+    >,
+    findingIdsByMarkerId = new Map<number, string[]>(),
+  ) =>
+    ensureLeadingMarkerContent(
+      content.map((segment) => {
+        if (segment.type !== 'marker') {
+          return segment
+        }
+
+        const markerItems = items.filter((item) => item.markerId === segment.id)
+
+        if (!markerItems.length) {
+          return segment
+        }
+
+        const shouldIncludeFindings = markerItems.some(
+          (item) => item.includeFindings,
+        )
+        const sectionFindingIds = shouldIncludeFindings
+          ? findingIdsByMarkerId.get(segment.id) ?? []
+          : []
+        const actionableMarkerItems = markerItems.filter(
+          (item) =>
+            !(
+              item.kind === 'section-option' &&
+              item.isFindingReferenceOnly &&
+              (!item.includeFindings || !sectionFindingIds.length)
+            ),
+        )
+
+        if (!actionableMarkerItems.length) {
+          return segment
+        }
+
+        const blockInfo = getMarkerBlockInfo(content, segment.id)
+        const optionState = getMarkerOptionState(segment, blockInfo)
+        const options = optionState.options.map(copyMarkerOption)
+        let selectedOptionIndex = optionState.selectedOptionIndex
+        const shouldSaveAsNew = actionableMarkerItems.some(
+          (item) => item.saveMode === 'new',
+        )
+        const mergeFindingIds = (
+          baseFindingIds: string[],
+          optionFindingIds: string[] = [],
+        ) => {
+          const nextFindingIds = shouldIncludeFindings
+            ? [...baseFindingIds, ...optionFindingIds, ...sectionFindingIds]
+            : baseFindingIds
+
+          return Array.from(
+            new Set(nextFindingIds.filter((findingId) => findingId.trim())),
+          )
+        }
+
+        if (shouldSaveAsNew) {
+          const currentItem =
+            actionableMarkerItems.find(
+              (item): item is ProtocolDownloadSectionCurrentSaveItem =>
+                item.kind === 'section-current',
+            ) ?? null
+          const optionItem =
+            actionableMarkerItems.find(
+              (item): item is ProtocolDownloadSectionOptionSaveItem =>
+                item.kind === 'section-option',
+            ) ?? null
+          const firstItem = actionableMarkerItems[0]
+          const baseOption =
+            optionItem?.option ??
+            options[firstItem.optionIndex] ??
+            createEmptyMarkerOption()
+          const newOptionTitle =
+            firstItem.newOptionLabel.trim() ||
+            `${firstItem.optionLabel} копия`
+          const nextOption: MarkerOption = {
+            ...copyMarkerOption(baseOption),
+            findingIds: mergeFindingIds(baseOption.findingIds),
+            title: newOptionTitle,
+            value: currentItem?.value ?? optionItem?.option.value ?? baseOption.value,
+          }
+          const newOptionIndex = options.length
+
+          options.push(nextOption)
+          selectedOptionIndex = newOptionIndex
+        } else {
+          actionableMarkerItems.forEach((item) => {
+            if (item.kind === 'section-current') {
+              const previousOption =
+                options[item.optionIndex] ?? createEmptyMarkerOption()
+
+              options[item.optionIndex] = {
+                ...previousOption,
+                findingIds: mergeFindingIds(previousOption.findingIds),
+                value: item.value,
+              }
+              selectedOptionIndex = item.optionIndex
+              return
+            }
+
+            const previousOption =
+              options[item.optionIndex] ?? createEmptyMarkerOption()
+            const nextOption = copyMarkerOption(item.option)
+
+            options[item.optionIndex] = {
+              ...nextOption,
+              findingIds: mergeFindingIds(
+                previousOption.findingIds,
+                nextOption.findingIds,
+              ),
+            }
+          })
+        }
+
+        return {
+          ...segment,
+          defaultOptionIndex: optionState.defaultOptionIndex,
+          options,
+          selectedOptionIndex,
+        }
+      }),
+    )
+
+  const saveSelectedProtocolDownloadItems = (
+    items: ProtocolDownloadSaveItem[],
+  ) => {
+    const selectedItems = items.filter((item) => item.checked)
+    const structureItems = selectedItems.filter(
+      (item): item is ProtocolDownloadSectionStructureSaveItem =>
+        item.kind === 'section-structure',
+    )
+    const sectionItems = selectedItems.filter(
+      (
+        item,
+      ): item is
+        | ProtocolDownloadSectionCurrentSaveItem
+        | ProtocolDownloadSectionOptionSaveItem =>
+        item.kind === 'section-current' || item.kind === 'section-option',
+    )
+    const findingItems = selectedItems.filter(
+      (item): item is ProtocolDownloadFindingSaveItem =>
+        item.kind === 'finding-new' || item.kind === 'finding-update',
+    )
+    const now = getTimestamp()
+    const findingSaveRecords = findingItems.map((item) => ({
+      item,
+      savedFindingId:
+        item.kind === 'finding-update' && item.savedFindingId
+          ? item.savedFindingId
+          : createSavedFindingId(),
+    }))
+    const findingIdsByMarkerId = findingSaveRecords.reduce(
+      (result, { item, savedFindingId }) => {
+        if (item.isSectionGroup && item.markerId !== null) {
+          result.set(item.markerId, [
+            ...(result.get(item.markerId) ?? []),
+            savedFindingId,
+          ])
+        }
+
+        return result
+      },
+      new Map<number, string[]>(),
+    )
+
+    if (structureItems.length && currentTemplateId !== null) {
+      const structureItem = structureItems.at(-1)
+
+      if (structureItem) {
+        const nextDescriptionContent = ensureLeadingMarkerContent(
+          copyContent(structureItem.descriptionContent),
+        )
+
+        setDescriptionContent(nextDescriptionContent)
+        setTemplates((currentTemplates) =>
+          currentTemplates.map((template) =>
+            template.id === currentTemplateId
+              ? {
+                  ...template,
+                  descriptionContent: copyContent(nextDescriptionContent),
+                  updatedAt: now,
+                }
+              : template,
+          ),
+        )
+      }
+    }
+
+    if (sectionItems.length) {
+      const freshDescriptionContent = getFreshContent('description')
+      const nextDescriptionContent = applySectionDownloadSaveItems(
+        freshDescriptionContent,
+        sectionItems,
+        findingIdsByMarkerId,
+      )
+      const savedRanges = sectionItems.flatMap((item) =>
+        item.kind === 'section-current' ? [item.range] : [],
+      )
+
+      setDescriptionContent(nextDescriptionContent)
+      setChangedDescriptionRanges((ranges) =>
+        savedRanges.length
+          ? ranges.filter(
+              (range) =>
+                !savedRanges.some(
+                  (savedRange) => getRangeOverlap(range, savedRange) > 0,
+                ),
+            )
+          : ranges,
+      )
+
+      if (currentTemplateId !== null) {
+        setTemplates((currentTemplates) =>
+          currentTemplates.map((template) =>
+            template.id === currentTemplateId
+              ? {
+                  ...template,
+                  descriptionContent: applySectionDownloadSaveItems(
+                    template.descriptionContent,
+                    sectionItems,
+                    findingIdsByMarkerId,
+                  ),
+                  updatedAt: now,
+                }
+              : template,
+          ),
+        )
+      }
+    }
+
+    if (findingItems.length) {
+      let resolvedFolders = normalizeFolderTree(findingFolders)
+      let hasCreatedFolder = false
+      const folderByItemId = new Map<string, string | null>()
+
+      findingItems.forEach((item) => {
+        if (
+          item.folderId &&
+          resolvedFolders.some((folder) => folder.id === item.folderId)
+        ) {
+          folderByItemId.set(item.id, item.folderId)
+          return
+        }
+
+        const folderName = normalizeFindingFolderName(item.folderName ?? '')
+
+        if (!folderName) {
+          folderByItemId.set(item.id, null)
+          return
+        }
+
+        const existingFolder = getRootFindingFolderByName(
+          resolvedFolders,
+          folderName,
+        )
+
+        if (existingFolder) {
+          folderByItemId.set(item.id, existingFolder.id)
+          return
+        }
+
+        const newFolder: FindingFolder = {
+          id: createFindingFolderId(),
+          name: folderName,
+          parentId: null,
+          createdAt: now,
+          updatedAt: now,
+        }
+
+        resolvedFolders = [...resolvedFolders, newFolder]
+        hasCreatedFolder = true
+        folderByItemId.set(item.id, newFolder.id)
+      })
+
+      if (hasCreatedFolder) {
+        setFindingFolders(resolvedFolders)
+      }
+
+      setSavedFindings((findings) => {
+        let nextFindings = findings
+
+        findingSaveRecords.forEach(({ item, savedFindingId }) => {
+          const existing =
+            nextFindings.find((finding) => finding.id === savedFindingId) ??
+            null
+          const nextFinding: SavedFinding = {
+            id: savedFindingId,
+            name: item.name,
+            description: item.description,
+            descriptionContent: copyContent(item.descriptionContent),
+            conclusion: item.conclusion,
+            conclusionContent: copyContent(item.conclusionContent),
+            folderId: folderByItemId.get(item.id) ?? null,
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now,
+          }
+
+          nextFindings = existing
+            ? nextFindings.map((finding) =>
+                finding.id === savedFindingId ? nextFinding : finding,
+              )
+            : [nextFinding, ...nextFindings]
+        })
+
+        return nextFindings
+      })
+      setFindingPairs((pairs) =>
+        pairs.map((pair) => {
+          const record = findingSaveRecords.find(({ item }) =>
+            item.pairId !== null
+              ? item.pairId === pair.id
+              : getRangeOverlap(item.descriptionRange, pair.description) > 0,
+          )
+
+          return record
+            ? { ...pair, savedFindingId: record.savedFindingId }
+            : pair
+        }),
+      )
+      setChangedDescriptionRanges((ranges) =>
+        ranges.filter(
+          (range) =>
+            !findingItems.some(
+              (item) => getRangeOverlap(range, item.descriptionRange) > 0,
+            ),
+        ),
+      )
+      setChangedConclusionRanges((ranges) =>
+        ranges.filter(
+          (range) =>
+            !findingItems.some(
+              (item) =>
+                item.conclusionRange &&
+                getRangeOverlap(range, item.conclusionRange) > 0,
+            ),
+        ),
+      )
+    }
+  }
+
+  const confirmProtocolDownloadSave = async () => {
+    const dialog = protocolDownloadSaveDialog
+
+    if (!dialog) {
+      return
+    }
+
+    saveSelectedProtocolDownloadItems(dialog.items)
+    setProtocolDownloadSaveDialog(null)
+    await performProtocolDownload()
+  }
+
+  const skipProtocolDownloadSave = async () => {
+    setProtocolDownloadSaveDialog(null)
+    await performProtocolDownload()
+  }
+
   const downloadProtocol = async () => {
+    const items = collectProtocolDownloadSaveItems()
+
+    if (items.length) {
+      setProtocolDownloadSaveDialog({ items })
+      return
+    }
+
+    await performProtocolDownload()
+  }
+
+  const performProtocolDownload = async () => {
     const freshDescriptionContent = getFreshContent('description')
     const freshConclusionContent = getFreshContent('conclusion')
     const protocolDocument = createProtocolDownloadDocument(
@@ -6883,7 +10195,208 @@ function App() {
 
   const closeStartCreateDialog = () => {
     setIsStartCreateDialogOpen(false)
+    setStartTemplateStep(1)
     setStartTemplateDraft(createEmptyStartTemplateDraft())
+    setStartTemplateDescriptionContent(createStartTemplateDescriptionContent(''))
+    setStartTemplateActiveMarkerId(null)
+    startTemplatePendingSelectionRef.current = null
+  }
+
+  const openStartCreateDialog = () => {
+    setStartTemplateStep(1)
+    setStartTemplateDraft(createEmptyStartTemplateDraft())
+    setStartTemplateDescriptionContent(createStartTemplateDescriptionContent(''))
+    setStartTemplateActiveMarkerId(null)
+    startTemplatePendingSelectionRef.current = null
+    setIsStartCreateDialogOpen(true)
+  }
+
+  const getFreshStartTemplateDescriptionContent = () => {
+    const editor = startTemplateDescriptionRef.current
+    const content = editor
+      ? parseEditorContent(editor, startTemplateDescriptionContent)
+      : startTemplateDescriptionContent
+
+    return ensureTerminalMarkerContent(
+      ensureSemanticBlockSpacesInContent(content),
+    )
+  }
+
+  const goToStartTemplateMarkerStep = () => {
+    if (!startTemplateDraft.name.trim()) {
+      return
+    }
+
+    const nextContent = createStartTemplateDescriptionContent(
+      startTemplateDraft.description,
+    )
+    const leadingMarkerId = getLeadingMarkerRange(nextContent)?.id ?? null
+
+    setStartTemplateDescriptionContent(nextContent)
+    setStartTemplateActiveMarkerId(leadingMarkerId)
+    startTemplatePendingSelectionRef.current = {
+      start: markerText.length,
+      end: markerText.length,
+    }
+    setStartTemplateStep(2)
+  }
+
+  const returnToStartTemplateTextStep = () => {
+    const content = getFreshStartTemplateDescriptionContent()
+
+    setStartTemplateDraft((draft) => ({
+      ...draft,
+      description: getProtocolContentText(content),
+    }))
+    setStartTemplateDescriptionContent(content)
+    setStartTemplateActiveMarkerId(null)
+    setStartTemplateStep(1)
+  }
+
+  const handleStartTemplateDescriptionInput = () => {
+    const editor = startTemplateDescriptionRef.current
+
+    if (!editor) {
+      return
+    }
+
+    const selection = getSelectionOffsets(editor)
+    const parsedContent = ensureTerminalMarkerContent(
+      ensureSemanticBlockSpacesInContent(
+        parseEditorContent(editor, startTemplateDescriptionContent),
+      ),
+    )
+    const safeSelection = selection
+      ? keepRangeAfterLeadingMarker(parsedContent, {
+          start: selection.end,
+          end: selection.end,
+        })
+      : null
+
+    if (safeSelection) {
+      startTemplatePendingSelectionRef.current = safeSelection
+    }
+
+    setStartTemplateDescriptionContent(parsedContent)
+    setStartTemplateActiveMarkerId(
+      safeSelection
+        ? getMarkerIdAtOffset(parsedContent, safeSelection.end)
+        : null,
+    )
+  }
+
+  const updateStartTemplateActiveMarker = () => {
+    const editor = startTemplateDescriptionRef.current
+    const selection = editor ? getSelectionOffsets(editor) : null
+
+    setStartTemplateActiveMarkerId(
+      selection
+        ? getMarkerIdAtOffset(startTemplateDescriptionContent, selection.end)
+        : null,
+    )
+  }
+
+  const handleStartTemplateDescriptionClick = (
+    event: MouseEvent<HTMLDivElement>,
+  ) => {
+    const editor = startTemplateDescriptionRef.current
+    const marker = (event.target as HTMLElement | null)?.closest<HTMLElement>(
+      '.section-marker-token',
+    )
+
+    if (editor && marker && editor.contains(marker)) {
+      const id = Number(marker.dataset.markerId)
+
+      setStartTemplateActiveMarkerId(Number.isNaN(id) ? null : id)
+      return
+    }
+
+    window.requestAnimationFrame(updateStartTemplateActiveMarker)
+  }
+
+  const handleStartTemplateDescriptionKeyDown = (
+    event: KeyboardEvent<HTMLDivElement>,
+  ) => {
+    const editor = startTemplateDescriptionRef.current
+    const selection = editor ? getSelectionOffsets(editor) : null
+    const leadingMarkerRange = getLeadingMarkerRange(
+      startTemplateDescriptionContent,
+    )
+
+    if (
+      editor &&
+      selection &&
+      leadingMarkerRange &&
+      selection.start === selection.end &&
+      selection.start < leadingMarkerRange.end
+    ) {
+      moveCollapsedSelectionAfterLeadingMarker(
+        editor,
+        startTemplateDescriptionContent,
+        selection,
+      )
+    }
+
+    if (
+      selection &&
+      leadingMarkerRange &&
+      selection.start === selection.end &&
+      selection.start <= leadingMarkerRange.end &&
+      (event.key === 'ArrowLeft' || event.key === 'Home')
+    ) {
+      event.preventDefault()
+      if (editor) {
+        restoreSelection(editor, leadingMarkerRange.end, leadingMarkerRange.end)
+      }
+      return
+    }
+
+    if (
+      selection &&
+      leadingMarkerRange &&
+      selection.start === selection.end &&
+      ((event.key === 'Backspace' &&
+        selection.start <= leadingMarkerRange.end) ||
+        (event.key === 'Delete' && selection.start < leadingMarkerRange.end))
+    ) {
+      event.preventDefault()
+      return
+    }
+
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      document.execCommand('insertText', false, '\n')
+    }
+  }
+
+  const insertStartTemplateSectionMarker = () => {
+    const editor = startTemplateDescriptionRef.current
+    const content = getFreshStartTemplateDescriptionContent()
+    const text = getContentText(content)
+    const selection = editor ? getSelectionOffsets(editor) : null
+    const offset =
+      selection?.end ?? getTerminalMarkerRange(content)?.start ?? text.length
+    const insertion = insertSectionMarkerIntoContent(content, offset)
+    const nextContent = ensureTerminalMarkerContent(insertion.content)
+
+    setStartTemplateDescriptionContent(nextContent)
+    setStartTemplateActiveMarkerId(insertion.marker.id)
+    startTemplatePendingSelectionRef.current = {
+      start: insertion.offset,
+      end: insertion.offset,
+    }
+  }
+
+  const changeStartTemplateMarkerTitle = (id: number, title: string) => {
+    setStartTemplateDescriptionContent((content) =>
+      ensureTerminalMarkerContent(
+        content.map((segment) =>
+          segment.type === 'marker' && segment.id === id
+            ? { ...segment, title }
+            : segment,
+        ),
+      ),
+    )
   }
 
   const createStartTemplate = () => {
@@ -6899,11 +10412,9 @@ function App() {
       name,
       createdAt: now,
       updatedAt: now,
-      descriptionContent: ensureLeadingMarkerContent(
+      descriptionContent: ensureTerminalMarkerContent(
         completeFinalFindingInContent(
-          startTemplateDraft.description
-            ? [createTextSegment(startTemplateDraft.description)]
-            : [],
+          copyContent(getFreshStartTemplateDescriptionContent()),
         ),
       ),
       conclusionContent: completeFinalFindingInContent(
@@ -7379,6 +10890,72 @@ function App() {
     addProtocolFileNameBlock(item.key, targetIndex)
   }
 
+  const renderFindingSearchBrowser = () => (
+    <div
+      aria-activedescendant={activeSearchBrowserItem?.key}
+      aria-label="Браузер находок"
+      className="search-browser-tree"
+      onKeyDown={handleSearchBrowserKeyDown}
+      role="tree"
+      tabIndex={0}
+    >
+      {findingSearchBrowserItems.length > 0 ? (
+        findingSearchBrowserItems.map((item) =>
+          item.type === 'folder' ? (
+            <button
+              aria-expanded={item.hasChildren ? item.isExpanded : undefined}
+              className={[
+                'search-browser-row',
+                'is-folder',
+                item.key === activeSearchBrowserItem?.key ? 'is-active' : '',
+              ]
+                .filter(Boolean)
+                .join(' ')}
+              id={item.key}
+              key={item.key}
+              onClick={() => activateSearchBrowserItem(item)}
+              role="treeitem"
+              style={{ paddingLeft: 10 + item.level * 16 }}
+              type="button"
+            >
+              <span className="search-browser-icon">
+                {item.hasChildren ? (item.isExpanded ? '-' : '+') : ''}
+              </span>
+              <span className="search-browser-folder-icon" aria-hidden="true" />
+              <strong>{item.folder.name}</strong>
+            </button>
+          ) : (
+            <button
+              className={[
+                'search-browser-row',
+                'is-finding',
+                item.key === activeSearchBrowserItem?.key ? 'is-active' : '',
+              ]
+                .filter(Boolean)
+                .join(' ')}
+              id={item.key}
+              key={item.key}
+              onClick={() => activateSearchBrowserItem(item)}
+              role="treeitem"
+              style={{ paddingLeft: 10 + item.level * 16 }}
+              type="button"
+            >
+              <span className="search-browser-icon">•</span>
+              <span className="search-browser-text">
+                <strong>{item.finding.name}</strong>
+                {item.finding.description && (
+                  <span>{item.finding.description}</span>
+                )}
+              </span>
+            </button>
+          ),
+        )
+      ) : (
+        <p className="saved-finding-empty">Нет сохраненных находок</p>
+      )}
+    </div>
+  )
+
   const renderFindingBrowserTree = (parentId: string | null, level = 0) => {
     const folderIds = new Set(findingFolders.map((folder) => folder.id))
     const childFolders = findingFolders.filter(
@@ -7727,6 +11304,28 @@ function App() {
       </div>
     ) : null
 
+  const renderProtocolDownloadSaveDialog = () =>
+    protocolDownloadSaveDialog ? (
+      <ProtocolDownloadSaveDialogPanel
+        dialog={protocolDownloadSaveDialog}
+        findingFolders={findingFolders}
+        onClose={closeProtocolDownloadSaveDialog}
+        onConfirm={confirmProtocolDownloadSave}
+        onFindingFolderChange={updateProtocolDownloadFindingFolder}
+        onFindingModeChange={updateProtocolDownloadFindingMode}
+        onFindingNameChange={updateProtocolDownloadFindingName}
+        onSaveItemCheckChange={updateProtocolDownloadSaveItem}
+        onSectionIncludeFindingsChange={
+          updateProtocolDownloadSectionIncludeFindings
+        }
+        onSectionNewOptionLabelChange={
+          updateProtocolDownloadSectionNewOptionLabel
+        }
+        onSectionSaveModeChange={updateProtocolDownloadSectionSaveMode}
+        onSkip={skipProtocolDownloadSave}
+        savedFindings={savedFindings}
+      />
+    ) : null
   const renderProtocolExportSettingsDialog = () =>
     isProtocolExportSettingsOpen ? (
       <div className="modal-backdrop" onMouseDown={closeProtocolExportSettings}>
@@ -8171,7 +11770,11 @@ function App() {
                           event.target.value,
                         )
                       }
-                      placeholder="Название"
+                      placeholder={
+                        isStandardMarkerOptionIndex(index, markerDialogBlock)
+                          ? standardMarkerOptionTitle
+                          : 'Название'
+                      }
                       ref={(element) => {
                         const key = getMarkerOptionTextareaKey(
                           markerDialogSegment.id,
@@ -8188,16 +11791,53 @@ function App() {
                       value={option.title}
                     />
                     <button
+                      aria-label={
+                        markerDialogOptionState.defaultOptionIndex === index
+                          ? `Заготовка ${index + 1} по умолчанию`
+                          : `Сделать заготовку ${index + 1} по умолчанию`
+                      }
+                      className={[
+                        'marker-option-default-button',
+                        markerDialogOptionState.defaultOptionIndex === index
+                          ? 'is-active'
+                          : '',
+                      ]
+                        .filter(Boolean)
+                        .join(' ')}
+                      disabled={!markerDialogBlock?.hasNextMarker}
+                      onClick={() =>
+                        makeMarkerOptionDefault(markerDialogSegment.id, index)
+                      }
+                      title={
+                        markerDialogOptionState.defaultOptionIndex === index
+                          ? 'По умолчанию'
+                          : 'Сделать по умолчанию'
+                      }
+                      type="button"
+                    >
+                      {defaultMarkerOptionIcon}
+                    </button>
+                    <button
                       aria-label={`Удалить заготовку ${index + 1}`}
                       className="marker-option-delete-button"
-                      disabled={!canDeleteMarkerOption(option, markerDialogBlock)}
+                      disabled={
+                        !canDeleteMarkerOption(
+                          option,
+                          markerDialogBlock,
+                          index,
+                        )
+                      }
                       onClick={() =>
                         deleteMarkerOption(markerDialogSegment.id, index)
                       }
                       title={
-                        canDeleteMarkerOption(option, markerDialogBlock)
+                        canDeleteMarkerOption(
+                          option,
+                          markerDialogBlock,
+                          index,
+                        )
                           ? 'Удалить заготовку'
-                          : 'Стандартная заготовка создается автоматически'
+                          : 'Начальная заготовка нужна как исходная'
                       }
                       type="button"
                     >
@@ -8289,6 +11929,52 @@ function App() {
                       spellCheck
                       suppressContentEditableWarning
                     />
+                    <div className="marker-option-findings-box">
+                      <span className="marker-option-findings-title">
+                        Находки
+                      </span>
+                      <div className="marker-option-finding-capsules">
+                        {option.findingIds.length ? (
+                          option.findingIds.map((findingId) => {
+                            const finding =
+                              savedFindings.find(
+                                (item) => item.id === findingId,
+                              ) ?? null
+
+                            return (
+                              <span
+                                className="marker-option-finding-chip"
+                                key={findingId}
+                                title={
+                                  finding?.name ?? 'Находка не найдена'
+                                }
+                              >
+                                <span>
+                                  {finding?.name ?? 'Находка не найдена'}
+                                </span>
+                                <button
+                                  aria-label="Убрать находку из заготовки"
+                                  onClick={() =>
+                                    removeMarkerOptionFinding(
+                                      markerDialogSegment.id,
+                                      index,
+                                      findingId,
+                                    )
+                                  }
+                                  type="button"
+                                >
+                                  x
+                                </button>
+                              </span>
+                            )
+                          })
+                        ) : (
+                          <span className="marker-option-findings-empty">
+                            Нет связанных находок
+                          </span>
+                        )}
+                      </div>
+                    </div>
                   </div>
                 </div>
                 <label className="variant-check marker-option-check">
@@ -8483,7 +12169,7 @@ function App() {
             <div className="start-template-grid">
               <button
                 className="start-template-card start-template-create-card"
-                onClick={() => setIsStartCreateDialogOpen(true)}
+                onClick={openStartCreateDialog}
                 type="button"
               >
                 <strong>New</strong>
@@ -8513,12 +12199,22 @@ function App() {
             <section
               aria-labelledby="start-create-template-title"
               aria-modal="true"
-              className="modal-panel start-create-modal"
+              className={[
+                'modal-panel',
+                'start-create-modal',
+                startTemplateStep === 2 ? 'is-marker-step' : '',
+              ]
+                .filter(Boolean)
+                .join(' ')}
               onMouseDown={(event) => event.stopPropagation()}
               role="dialog"
             >
               <div className="modal-header">
-                <h2 id="start-create-template-title">Новый шаблон</h2>
+                <h2 id="start-create-template-title">
+                  {startTemplateStep === 1
+                    ? 'Новый шаблон'
+                    : 'Разметка шаблона'}
+                </h2>
                 <button
                   aria-label="Закрыть"
                   className="modal-close-button"
@@ -8529,59 +12225,172 @@ function App() {
                 </button>
               </div>
 
-              <label className="modal-field">
-                <span>Название</span>
-                <input
-                  autoFocus
-                  onChange={(event) =>
-                    setStartTemplateDraft((draft) => ({
-                      ...draft,
-                      name: event.target.value,
-                    }))
-                  }
-                  placeholder="Например, Рентгенография ОГК"
-                  type="text"
-                  value={startTemplateDraft.name}
-                />
-              </label>
-
-              <label className="modal-field">
-                <span>Описание</span>
-                <textarea
-                  onChange={(event) =>
-                    setStartTemplateDraft((draft) => ({
-                      ...draft,
-                      description: event.target.value,
-                    }))
-                  }
-                  placeholder="Стартовый текст описания"
-                  value={startTemplateDraft.description}
-                />
-              </label>
-
-              <label className="modal-field">
-                <span>Заключение</span>
-                <textarea
-                  onChange={(event) =>
-                    setStartTemplateDraft((draft) => ({
-                      ...draft,
-                      conclusion: event.target.value,
-                    }))
-                  }
-                  placeholder="Стартовый текст заключения"
-                  value={startTemplateDraft.conclusion}
-                />
-              </label>
-
-              <div className="modal-actions">
-                <button
-                  disabled={!startTemplateDraft.name.trim()}
-                  onClick={createStartTemplate}
-                  type="button"
-                >
-                  Создать
-                </button>
+              <div className="start-create-progress" aria-label="Этап создания">
+                <span className={startTemplateStep === 1 ? 'is-active' : ''}>
+                  1. Текст
+                </span>
+                <span className={startTemplateStep === 2 ? 'is-active' : ''}>
+                  2. Метки
+                </span>
               </div>
+
+              {startTemplateStep === 1 ? (
+                <>
+                  <label className="modal-field">
+                    <span>Название</span>
+                    <input
+                      autoFocus
+                      onChange={(event) =>
+                        setStartTemplateDraft((draft) => ({
+                          ...draft,
+                          name: event.target.value,
+                        }))
+                      }
+                      placeholder="Например, Рентгенография ОГК"
+                      type="text"
+                      value={startTemplateDraft.name}
+                    />
+                  </label>
+
+                  <label className="modal-field">
+                    <span>Описание</span>
+                    <textarea
+                      onChange={(event) =>
+                        setStartTemplateDraft((draft) => ({
+                          ...draft,
+                          description: event.target.value,
+                        }))
+                      }
+                      placeholder="Стартовый текст описания"
+                      value={startTemplateDraft.description}
+                    />
+                  </label>
+
+                  <label className="modal-field">
+                    <span>Заключение</span>
+                    <textarea
+                      onChange={(event) =>
+                        setStartTemplateDraft((draft) => ({
+                          ...draft,
+                          conclusion: event.target.value,
+                        }))
+                      }
+                      placeholder="Стартовый текст заключения"
+                      value={startTemplateDraft.conclusion}
+                    />
+                  </label>
+
+                  <div className="modal-actions">
+                    <button
+                      disabled={!startTemplateDraft.name.trim()}
+                      onClick={goToStartTemplateMarkerStep}
+                      type="button"
+                    >
+                      Далее
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p className="start-marker-hint">
+                    Абзацы из описания уже разбиты на разделы: каждый раздел
+                    хранится одним блоком. Добавьте метки вручную, если нужно
+                    разделить блок точнее; метка К закрывает последний раздел.
+                  </p>
+
+                  <div className="start-marker-builder">
+                    <div className="start-marker-workspace">
+                      <div className="start-marker-toolbar">
+                        <button
+                          onClick={insertStartTemplateSectionMarker}
+                          type="button"
+                        >
+                          Поставить метку
+                        </button>
+                        <span>{startTemplateDescriptionText.length} знаков</span>
+                      </div>
+
+                      <div className="start-marker-field">
+                        <span>Описание</span>
+                        <div
+                          aria-label="Описание шаблона"
+                          aria-multiline="true"
+                          className="editor start-template-editor"
+                          contentEditable
+                          data-empty={
+                            startTemplateDescriptionText.trim()
+                              ? undefined
+                              : 'true'
+                          }
+                          data-placeholder="Описание шаблона"
+                          dangerouslySetInnerHTML={{
+                            __html: startTemplateDescriptionHtml,
+                          }}
+                          onClick={handleStartTemplateDescriptionClick}
+                          onInput={handleStartTemplateDescriptionInput}
+                          onKeyDown={handleStartTemplateDescriptionKeyDown}
+                          onKeyUp={updateStartTemplateActiveMarker}
+                          onMouseUp={updateStartTemplateActiveMarker}
+                          onPaste={handleEditorPaste}
+                          ref={startTemplateDescriptionRef}
+                          role="textbox"
+                          spellCheck
+                          suppressContentEditableWarning
+                        />
+                      </div>
+
+                    </div>
+
+                    <aside className="start-section-panel">
+                      <h3>Разделы</h3>
+                      <div className="start-section-list">
+                        {startTemplateSectionMarkers.map(({ number, segment }) => (
+                          <label
+                            className={[
+                              'start-section-row',
+                              startTemplateActiveMarkerId === segment.id
+                                ? 'is-active'
+                                : '',
+                            ]
+                              .filter(Boolean)
+                              .join(' ')}
+                            key={segment.id}
+                          >
+                            <span>{number}</span>
+                            <input
+                              onChange={(event) =>
+                                changeStartTemplateMarkerTitle(
+                                  segment.id,
+                                  event.target.value,
+                                )
+                              }
+                              placeholder={`Раздел ${number}`}
+                              type="text"
+                              value={segment.title}
+                            />
+                          </label>
+                        ))}
+                      </div>
+                    </aside>
+                  </div>
+
+                  <div className="modal-actions">
+                    <button
+                      onClick={returnToStartTemplateTextStep}
+                      type="button"
+                    >
+                      Назад
+                    </button>
+                    <button
+                      disabled={!startTemplateDraft.name.trim()}
+                      onClick={createStartTemplate}
+                      type="button"
+                    >
+                      Создать шаблон
+                    </button>
+                  </div>
+                </>
+              )}
             </section>
           </div>
         )}
@@ -8591,6 +12400,7 @@ function App() {
         {renderPassportSettingsDialog()}
         {renderUserSwitchConfirmDialog()}
         {renderProtocolSessionCloseDialog()}
+        {renderProtocolDownloadSaveDialog()}
       </main>
     )
   }
@@ -8655,6 +12465,21 @@ function App() {
                   aria-hidden="true"
                   className="field-tool-icon variant-list-icon"
                 />
+              </button>
+              <button
+                aria-label="Добавить смысловой блок"
+                className="field-tool-button"
+                onClick={insertSemanticBlockAfterCursor}
+                onMouseDown={(event) => event.preventDefault()}
+                title="Добавить смысловой блок"
+                type="button"
+              >
+                <span
+                  aria-hidden="true"
+                  className="field-tool-icon semantic-block-icon"
+                >
+                  {'{}'}
+                </span>
               </button>
               <button
                 aria-label="Метка раздела"
@@ -8770,6 +12595,12 @@ function App() {
         onPointerDown={startSidePanelResize}
         role="separator"
       />
+
+      {editorWarning && (
+        <div className="editor-warning-toast" role="status">
+          {editorWarning}
+        </div>
+      )}
 
       <aside className="side-panel" aria-label="Панель вариантов">
         <div className="panel-heading">
@@ -8968,7 +12799,16 @@ function App() {
                   description: descriptionValue,
                   conclusion: conclusionValue,
                 } = getFindingSnapshot(range)
-                const isActive = pair?.id === highlightedPairId
+                const isNavigationActive =
+                  navigationHighlight?.field === 'description' &&
+                  isSameRange(navigationHighlight.range, range)
+                const isActive =
+                  pair?.id === highlightedPairId || isNavigationActive
+                const savedOrigin = getFindingSavedOrigin(
+                  pair,
+                  descriptionValue,
+                  conclusionValue,
+                )
                 const lateralityWarning = getLateralityWarning(
                   descriptionValue,
                   conclusionValue,
@@ -8986,10 +12826,40 @@ function App() {
                       .join(' ')}
                     key={`${range.start}-${range.end}`}
                   >
+                    <div className="finding-summary-badges">
+                      <button
+                        aria-label={`Находка ${index + 1}`}
+                        className="finding-summary-number finding-summary-number-button"
+                        onClick={() => activateFindingCapsule(range)}
+                        title={descriptionValue}
+                        type="button"
+                      >
+                        {index + 1}
+                      </button>
+                      <span
+                        aria-label={
+                          savedOrigin ? 'Saved finding' : 'Unsaved finding'
+                        }
+                        className={[
+                          'finding-summary-saved-status',
+                          savedOrigin ? 'is-saved' : '',
+                        ]
+                          .filter(Boolean)
+                          .join(' ')}
+                        role="img"
+                        title={
+                          savedOrigin
+                            ? `Saved: ${savedOrigin.name}`
+                            : 'Not saved'
+                        }
+                      >
+                        {'\u2713'}
+                      </span>
+                    </div>
                     <button
                       aria-label={`Находка ${index + 1}`}
                       className="finding-summary-content"
-                      onClick={() => activateFindingCapsule(range)}
+                      onClick={() => navigateFindingSummary(range)}
                       title={[
                         descriptionValue,
                         conclusionValue,
@@ -9001,9 +12871,6 @@ function App() {
                         .join('\n')}
                       type="button"
                     >
-                      <span className="finding-summary-number">
-                        {index + 1}
-                      </span>
                       <span className="finding-summary-body">
                         <span className="finding-summary-description">
                           {descriptionValue}
@@ -9029,11 +12896,13 @@ function App() {
                       </span>
                     </button>
                     <button
-                      className="finding-save-button"
-                      onClick={() => openFindingSaveDialog(range)}
+                      aria-label={`Удалить находку ${index + 1}`}
+                      className="finding-delete-button"
+                      onClick={() => deleteFindingSummary(range)}
+                      title="Удалить находку"
                       type="button"
                     >
-                      Сохранить
+                      Удалить
                     </button>
                   </div>
                 )
@@ -9064,12 +12933,24 @@ function App() {
           {markerMenuOptions.length ? (
             markerMenuOptions.map((option, index) => (
               <button
+                className="marker-menu-option"
                 key={index}
                 onClick={() => applyMarkerOption(markerMenu.id, index)}
                 title={option.value}
                 type="button"
               >
-                {getMarkerOptionLabel(option, index)}
+                <span className="marker-menu-option-label">
+                  {getMarkerOptionLabel(option, index, markerMenuBlock)}
+                </span>
+                {markerMenuOptionState.defaultOptionIndex === index && (
+                  <span
+                    aria-label="По умолчанию"
+                    className="marker-default-badge"
+                    title="По умолчанию"
+                  >
+                    {defaultMarkerOptionIcon}
+                  </span>
+                )}
               </button>
             ))
           ) : (
@@ -9096,7 +12977,7 @@ function App() {
               markerContextMenuSelectedOptionIndex === null
             }
             onClick={() =>
-              updateSelectedMarkerOptionFromBlock(markerContextMenu.id)
+              requestMarkerOptionSave(markerContextMenu.id, 'update')
             }
             title={
               markerContextMenuSelectedOptionIndex === null
@@ -9111,7 +12992,7 @@ function App() {
           </button>
           <button
             disabled={!markerContextMenuBlock?.hasNextMarker}
-            onClick={() => saveMarkerBlockAsNewOption(markerContextMenu.id)}
+            onClick={() => requestMarkerOptionSave(markerContextMenu.id, 'new')}
             title={
               markerContextMenuBlock?.hasNextMarker
                 ? 'Создать новую заготовку из текущего текста раздела'
@@ -9140,6 +13021,53 @@ function App() {
           >
             Удалить раздел
           </button>
+        </div>
+      )}
+
+      {pendingMarkerOptionSaveAction && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={() => setPendingMarkerOptionSaveAction(null)}
+        >
+          <section
+            aria-labelledby="marker-save-mode-title"
+            aria-modal="true"
+            className="modal-panel marker-save-mode-modal"
+            onMouseDown={(event) => event.stopPropagation()}
+            role="dialog"
+          >
+            <div className="modal-header">
+              <h2 id="marker-save-mode-title">
+                Включить находки в шаблон раздела?
+              </h2>
+              <button
+                aria-label="Закрыть"
+                className="modal-close-button"
+                onClick={() => setPendingMarkerOptionSaveAction(null)}
+                type="button"
+              >
+                x
+              </button>
+            </div>
+            <p className="marker-save-mode-text">
+              Нет сохранит только основной блок раздела. Да добавит находки
+              отдельными ссылками на память.
+            </p>
+            <div className="modal-actions">
+              <button
+                onClick={() => completePendingMarkerOptionSave(false)}
+                type="button"
+              >
+                Нет
+              </button>
+              <button
+                onClick={() => completePendingMarkerOptionSave(true)}
+                type="button"
+              >
+                Да
+              </button>
+            </div>
+          </section>
         </div>
       )}
 
@@ -9248,15 +13176,10 @@ function App() {
       {renderPassportSettingsDialog()}
       {renderUserSwitchConfirmDialog()}
       {renderProtocolSessionCloseDialog()}
+      {renderProtocolDownloadSaveDialog()}
 
       {isFindingSearchOpen && (
-        <div
-          className="modal-backdrop"
-          onMouseDown={() => {
-            setIsFindingSearchOpen(false)
-            setFindingSearchWarning('')
-          }}
-        >
+        <div className="modal-backdrop" onMouseDown={closeFindingSearch}>
           <section
             aria-labelledby="finding-search-title"
             aria-modal="true"
@@ -9269,10 +13192,7 @@ function App() {
               <button
                 aria-label="Закрыть"
                 className="modal-close-button"
-                onClick={() => {
-                  setIsFindingSearchOpen(false)
-                  setFindingSearchWarning('')
-                }}
+                onClick={closeFindingSearch}
                 type="button"
               >
                 x
@@ -9285,6 +13205,7 @@ function App() {
                 setFindingSearchQuery(event.target.value)
                 setFindingSearchWarning('')
               }}
+              onKeyDown={handleSearchBrowserKeyDown}
               placeholder="Поиск"
               type="text"
               value={findingSearchQuery}
@@ -9292,6 +13213,7 @@ function App() {
             {findingSearchWarning && (
               <p className="search-warning">{findingSearchWarning}</p>
             )}
+            {findingSearchQuery.trim() ? (
             <div className="saved-finding-list">
               {filteredSavedFindings.length > 0 ? (
                 filteredSavedFindings.map((finding) => (
@@ -9316,6 +13238,9 @@ function App() {
                 <p className="saved-finding-empty">Ничего не найдено</p>
               )}
             </div>
+            ) : (
+              renderFindingSearchBrowser()
+            )}
           </section>
         </div>
       )}
