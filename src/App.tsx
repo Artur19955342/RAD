@@ -2610,6 +2610,55 @@ const getMarkerIdAtOffset = (content: EditorSegment[], offset: number) => {
   return null
 }
 
+const getSectionRangeForSemanticBlock = (
+  content: EditorSegment[],
+  block: FullSemanticBlockInfo,
+) => {
+  const text = getContentText(content)
+  const markerRanges = getMarkerRanges(content)
+
+  if (!markerRanges.length) {
+    return { start: 0, end: text.length }
+  }
+
+  const markerId = getMarkerIdAtOffset(content, block.start)
+
+  if (markerId !== null) {
+    const blockInfo = getMarkerBlockInfo(content, markerId)
+
+    if (blockInfo) {
+      return { start: blockInfo.blockStart, end: blockInfo.blockEnd }
+    }
+  }
+
+  const nextMarkerRange =
+    markerRanges.find((range) => range.start >= block.end) ?? null
+  const previousMarkerRange =
+    markerRanges.filter((range) => range.end <= block.start).at(-1) ?? null
+
+  return {
+    start: previousMarkerRange?.end ?? 0,
+    end: nextMarkerRange?.start ?? text.length,
+  }
+}
+
+const isLastSemanticBlockInSection = (
+  content: EditorSegment[],
+  block: FullSemanticBlockInfo,
+) => {
+  const text = getContentText(content)
+  const sectionRange = getSectionRangeForSemanticBlock(content, block)
+
+  if (block.start < sectionRange.start || block.end > sectionRange.end) {
+    return false
+  }
+
+  return !getAllSemanticBlockInfos(text).some(
+    (candidate) =>
+      candidate.start >= block.end && candidate.end <= sectionRange.end,
+  )
+}
+
 const ensureTerminalMarkerContent = (content: EditorSegment[]) => {
   const normalizedContent = ensureLeadingMarkerContent(content)
 
@@ -2967,32 +3016,6 @@ const getVariantIdFromSelection = (editor: HTMLElement) => {
   const id = Number(variantElement?.dataset.variantId)
 
   return Number.isNaN(id) ? null : id
-}
-
-const getOffsetFromPoint = (editor: HTMLElement, x: number, y: number) => {
-  const caretDocument = document as Document & {
-    caretPositionFromPoint?: (
-      x: number,
-      y: number,
-    ) => { offsetNode: Node; offset: number } | null
-    caretRangeFromPoint?: (x: number, y: number) => Range | null
-  }
-  const caretPosition = caretDocument.caretPositionFromPoint?.(x, y)
-  const caretRange = caretPosition
-    ? null
-    : caretDocument.caretRangeFromPoint?.(x, y)
-  const node = caretPosition?.offsetNode ?? caretRange?.startContainer
-  const offset = caretPosition?.offset ?? caretRange?.startOffset
-
-  if (!node || offset === undefined || !editor.contains(node)) {
-    return null
-  }
-
-  const range = document.createRange()
-  range.selectNodeContents(editor)
-  range.setEnd(node, offset)
-
-  return range.toString().length
 }
 
 const isWordCharacter = (char: string) => /[\p{L}\p{N}_-]/u.test(char)
@@ -3843,6 +3866,14 @@ type PendingMarkerOptionSaveAction = {
   markerId: number
 }
 
+type PendingBoundaryPairBreak = {
+  field: FieldName
+  nextContent: EditorSegment[]
+  nextCursorOffset: number
+  pairIds: number[]
+  pairLabels: string[]
+}
+
 function App() {
   const workspaceRef = useRef<HTMLElement>(null)
   const descriptionRef = useRef<HTMLDivElement>(null)
@@ -3877,7 +3908,7 @@ function App() {
   const [conclusionContent, setConclusionContent] = useState<EditorSegment[]>(
     [],
   )
-  const [contextMenu, setContextMenu] = useState<SavedSelection | null>(null)
+  const [, setContextMenu] = useState<SavedSelection | null>(null)
   const [markerMenu, setMarkerMenu] = useState<MarkerMenu | null>(null)
   const [markerContextMenu, setMarkerContextMenu] =
     useState<MarkerMenu | null>(null)
@@ -3969,6 +4000,8 @@ function App() {
     useState<ProtocolSaveNotice | null>(null)
   const [protocolDownloadSaveDialog, setProtocolDownloadSaveDialog] =
     useState<ProtocolDownloadSaveDialogState | null>(null)
+  const [pendingBoundaryPairBreak, setPendingBoundaryPairBreak] =
+    useState<PendingBoundaryPairBreak | null>(null)
   const [findingSearchQuery, setFindingSearchQuery] = useState('')
   const [findingSearchWarning, setFindingSearchWarning] = useState('')
   const [expandedSearchFolderIds, setExpandedSearchFolderIds] = useState<
@@ -4421,9 +4454,8 @@ function App() {
       contentToHtml(
         descriptionContent,
         descriptionHighlights,
-        activeMarker?.id ?? null,
       ),
-    [activeMarker, descriptionContent, descriptionHighlights],
+    [descriptionContent, descriptionHighlights],
   )
 
   const conclusionHighlights = useMemo(() => {
@@ -4538,7 +4570,35 @@ function App() {
     setHasLoadedTemplate(false)
     setChangedDescriptionRanges([])
     setChangedConclusionRanges([])
+    setPendingBoundaryPairBreak(null)
   }, [])
+
+  useLayoutEffect(() => {
+    const editor = descriptionRef.current
+    const activeMarkerId = activeMarker?.id ?? null
+
+    if (!editor) {
+      return
+    }
+
+    editor
+      .querySelectorAll<HTMLElement>('.section-marker-token')
+      .forEach((marker) => {
+        const markerId = Number(marker.dataset.markerId)
+        const isKnownMarker = Number.isFinite(markerId)
+
+        marker.classList.toggle(
+          'is-active',
+          isKnownMarker && markerId === activeMarkerId,
+        )
+        marker.classList.toggle(
+          'is-muted',
+          isKnownMarker &&
+            activeMarkerId !== null &&
+            markerId !== activeMarkerId,
+        )
+      })
+  }, [activeMarker, descriptionContent])
 
   useLayoutEffect(() => {
     const pendingSelection = pendingSelectionRef.current
@@ -4782,18 +4842,7 @@ function App() {
       }
     }
 
-    return contextMenu && (!preferredField || contextMenu.field === preferredField)
-      ? contextMenu
-      : null
-  }
-
-  const rememberActionSelection = (selection: SavedSelection) => {
-    if (selection.start === selection.end || !selection.text.trim()) {
-      setContextMenu(null)
-      return
-    }
-
-    setContextMenu(selection)
+    return null
   }
 
   const rememberMarkerOptionSelection = (
@@ -5105,6 +5154,7 @@ function App() {
     setIsTemplatesDialogOpen(false)
     setIsFindingSearchOpen(false)
     setIsFindingBrowserOpen(false)
+    setPendingBoundaryPairBreak(null)
     setFindingSearchWarning('')
     setFindingBrowserWarning('')
     setActiveMarker(null)
@@ -6362,11 +6412,7 @@ function App() {
     lastActiveEditorRef.current = field
     setActiveCursorField(field)
 
-    if (selection.start === selection.end || !selection.text.trim()) {
-      setContextMenu(null)
-    } else {
-      rememberActionSelection({ field, ...selection })
-    }
+    setContextMenu(null)
 
     if (field === 'description') {
       rememberDescriptionSelection(
@@ -6407,23 +6453,6 @@ function App() {
       field === 'description'
         ? getMarkerIdAtOffset(currentFieldContent, selection.end)
         : null
-
-    if (
-      field === 'description' &&
-      (markerId ?? null) !== (activeMarker?.id ?? null) &&
-      document.activeElement === editor
-    ) {
-      const safeSelection = keepRangeAfterLeadingMarker(currentFieldContent, {
-        start: selection.start,
-        end: selection.end,
-      })
-
-      pendingSelectionRef.current = createPendingSelection(
-          'description',
-          safeSelection,
-          currentFieldText,
-        )
-    }
 
     setActiveMarker((current) =>
       current?.id === markerId ? current : markerId ? { id: markerId } : null,
@@ -6718,6 +6747,7 @@ function App() {
     field: FieldName,
     nextContent: EditorSegment[],
     nextCursorOffset: number,
+    options: { unlinkPairIds?: number[] } = {},
   ) => {
     const previousText =
       field === 'description' ? descriptionText : conclusionText
@@ -6725,17 +6755,32 @@ function App() {
       field === 'description' ? ensureLeadingMarkerContent(nextContent) : nextContent
     const nextText = getContentText(normalizedContent)
     const change = trackManualTextChange(field, previousText, nextText)
+    const unlinkPairIds = new Set(options.unlinkPairIds ?? [])
 
-    if (change) {
+    if (change || unlinkPairIds.size) {
       setFindingPairs((pairs) =>
-        adjustPairsForFieldTextChange(
-          pairs,
-          field,
-          change,
-          activePairId,
-          nextText,
-        ),
+        change
+          ? adjustPairsForFieldTextChange(
+              pairs.filter((pair) => !unlinkPairIds.has(pair.id)),
+              field,
+              change,
+              unlinkPairIds.has(activePairId ?? -1) ? null : activePairId,
+              nextText,
+            )
+          : pairs.filter((pair) => !unlinkPairIds.has(pair.id)),
       )
+    }
+
+    if (unlinkPairIds.has(activePairId ?? -1)) {
+      setActivePairId(null)
+    }
+
+    if (unlinkPairIds.has(highlightedPairId ?? -1)) {
+      setHighlightedPairId(null)
+    }
+
+    if (unlinkPairIds.size) {
+      findingNavigationRef.current = null
     }
 
     updateContent(field, () => normalizedContent)
@@ -6770,8 +6815,22 @@ function App() {
       selection.start === selection.end
         ? getSemanticBlockAtOffset(currentText, selection.end)
         : null
+    const selectedBlock =
+      selection.start !== selection.end
+        ? getSemanticBlockAtOffset(currentText, selection.start) ??
+          getSemanticBlockAtOffset(currentText, Math.max(selection.end - 1, 0))
+        : null
+    const isSelectionInsideSingleBlock = Boolean(
+      selectedBlock &&
+        selection.start >= selectedBlock.contentStart &&
+        selection.end <= selectedBlock.contentEnd,
+    )
 
     if (event.key === ' ') {
+      if (isSelectionInsideSingleBlock) {
+        return false
+      }
+
       if (
         blockAtCursor &&
         selection.end <= blockAtCursor.contentEnd &&
@@ -6837,7 +6896,7 @@ function App() {
       return false
     }
 
-    if (!isPlainTextKey || blockAtCursor) {
+    if (!isPlainTextKey || blockAtCursor || isSelectionInsideSingleBlock) {
       return false
     }
 
@@ -6876,6 +6935,22 @@ function App() {
 
       if (selection.start === selection.end) {
         const offset = selection.end
+        const openingBraceIndex = boundary.end - 1
+        const isBackspaceOnBoundarySpace =
+          key === 'Backspace' &&
+          offset > boundary.start + 1 &&
+          offset <= openingBraceIndex &&
+          /[ \t]/.test(text[offset - 1] ?? '')
+        const isDeleteOnBoundarySpace =
+          key === 'Delete' &&
+          offset > boundary.start &&
+          offset < openingBraceIndex &&
+          /[ \t]/.test(text[offset] ?? '')
+
+        if (isBackspaceOnBoundarySpace || isDeleteOnBoundarySpace) {
+          return null
+        }
+
         const isBackspaceBoundary =
           key === 'Backspace' && offset > boundary.start && offset <= boundary.end
         const isDeleteBoundary =
@@ -6889,6 +6964,17 @@ function App() {
         selection.end <= boundary.end &&
         getRangeOverlap(selection, boundary) > 0
       ) {
+        const openingBraceIndex = boundary.end - 1
+        const selectedBoundaryText = text.slice(selection.start, selection.end)
+        const isOnlyBoundarySpacesSelected =
+          selection.start > boundary.start &&
+          selection.end <= openingBraceIndex &&
+          /^[ \t]+$/.test(selectedBoundaryText)
+
+        if (isOnlyBoundarySpacesSelected) {
+          return null
+        }
+
         return boundary
       }
 
@@ -6896,6 +6982,111 @@ function App() {
     }
 
     return null
+  }
+
+  const getSemanticBlockContentRangesForBoundaryEdit = (
+    text: string,
+    range: TextRange,
+  ) =>
+    getAllSemanticBlockInfos(text)
+      .filter(
+        (block) =>
+          getRangeOverlap(
+            { start: block.start, end: block.end },
+            range,
+          ) > 0,
+      )
+      .map((block) => ({
+        start: block.contentStart,
+        end: block.contentEnd,
+      }))
+      .filter((block) => block.end > block.start)
+
+  const getBoundaryPairLabel = (
+    pair: FindingPair,
+    field: FieldName,
+    fieldText: string,
+  ) => {
+    const descriptionSource =
+      field === 'description' ? fieldText : descriptionText
+    const conclusionSource =
+      field === 'conclusion' ? fieldText : conclusionText
+    const description = getProtocolSavePreviewText(
+      getRangeText(descriptionSource, pair.description),
+      72,
+    )
+    const conclusion =
+      pair.conclusion.end > pair.conclusion.start
+        ? getProtocolSavePreviewText(
+            getRangeText(conclusionSource, pair.conclusion),
+            72,
+          )
+        : ''
+
+    if (description && conclusion) {
+      return `${description} -> ${conclusion}`
+    }
+
+    return description || conclusion || `Связь ${pair.id}`
+  }
+
+  const getBoundaryEditAffectedPairs = (
+    field: FieldName,
+    fieldText: string,
+    ranges: TextRange[],
+  ) => {
+    const pairIds = new Set<number>()
+
+    return findingPairs.flatMap((pair) => {
+      const pairRange = getPairRange(pair, field)
+      const isAffected = ranges.some(
+        (range) => getRangeOverlap(pairRange, range) > 0,
+      )
+
+      if (!isAffected || pairIds.has(pair.id)) {
+        return []
+      }
+
+      pairIds.add(pair.id)
+
+      return [
+        {
+          id: pair.id,
+          label: getBoundaryPairLabel(pair, field, fieldText),
+        },
+      ]
+    })
+  }
+
+  const applyOrConfirmBoundaryContentChange = (
+    field: FieldName,
+    currentText: string,
+    editRange: TextRange,
+    nextContent: EditorSegment[],
+    nextCursorOffset: number,
+  ) => {
+    const affectedRanges = getSemanticBlockContentRangesForBoundaryEdit(
+      currentText,
+      editRange,
+    )
+    const affectedPairs = getBoundaryEditAffectedPairs(
+      field,
+      currentText,
+      affectedRanges,
+    )
+
+    if (!affectedPairs.length) {
+      applySemanticBlockContentChange(field, nextContent, nextCursorOffset)
+      return
+    }
+
+    setPendingBoundaryPairBreak({
+      field,
+      nextContent,
+      nextCursorOffset,
+      pairIds: affectedPairs.map((pair) => pair.id),
+      pairLabels: affectedPairs.map((pair) => pair.label),
+    })
   }
 
   const handleSemanticBlockBoundaryDelete = (
@@ -6916,6 +7107,31 @@ function App() {
     const currentContent = parseEditorContent(editor, getCurrentContent(field))
     const currentText = getContentText(currentContent)
 
+    if (selection.start === selection.end && event.key === 'Backspace') {
+      const previousBlock =
+        getAllSemanticBlockInfos(currentText).find(
+          (block) => block.end === selection.start,
+        ) ?? null
+
+      if (
+        previousBlock &&
+        previousBlock.contentEnd > previousBlock.contentStart &&
+        isLastSemanticBlockInSection(currentContent, previousBlock)
+      ) {
+        event.preventDefault()
+
+        const deleteStart = previousBlock.contentEnd - 1
+        const nextContent = removeRangeFromContent(
+          currentContent,
+          deleteStart,
+          previousBlock.contentEnd,
+        )
+
+        applySemanticBlockContentChange(field, nextContent, deleteStart)
+        return true
+      }
+    }
+
     if (
       field === 'description' &&
       getProtectedMainBlockBoundaryHit(currentContent, selection, event.key)
@@ -6933,11 +7149,18 @@ function App() {
 
     if (boundary) {
       event.preventDefault()
-      applySemanticBlockContentChange(
+      const nextContent = replaceRangeWithContent(
+        currentContent,
+        boundary.start,
+        boundary.end,
+        [createTextSegment(' ')],
+      )
+
+      applyOrConfirmBoundaryContentChange(
         field,
-        replaceRangeWithContent(currentContent, boundary.start, boundary.end, [
-          createTextSegment(' '),
-        ]),
+        currentText,
+        boundary,
+        nextContent,
         boundary.start + 1,
       )
       return true
@@ -6961,8 +7184,10 @@ function App() {
           : ensureSemanticBlockSpacesInContent(nextContent)
         nextText = getContentText(nextContent)
 
-        applySemanticBlockContentChange(
+        applyOrConfirmBoundaryContentChange(
           field,
+          currentText,
+          selection,
           nextContent,
           Math.min(selection.start, nextText.length),
         )
@@ -7541,9 +7766,9 @@ function App() {
       return
     }
 
-    event.preventDefault()
-
     if (marker && editor.contains(marker)) {
+      event.preventDefault()
+
       const id = Number(marker.dataset.markerId)
       const markerSegment = descriptionContent.find(
         (segment): segment is MarkerSegment =>
@@ -7564,41 +7789,9 @@ function App() {
       return
     }
 
-    const selection = window.getSelection()
-    const hasSelection = Boolean(
-      selection && !selection.isCollapsed && isSelectionInside(editor, selection),
-    )
-    const editorText = editor.textContent ?? ''
-    let offsets = hasSelection ? getSelectionOffsets(editor) : null
-
-    if (!offsets) {
-      const clickedOffset = getOffsetFromPoint(editor, event.clientX, event.clientY)
-      const wordRange =
-        clickedOffset === null
-          ? null
-          : getWordRangeAtOffset(editorText, clickedOffset)
-
-      if (!wordRange) {
-        setContextMenu(null)
-        return
-      }
-
-      restoreSelection(editor, wordRange.start, wordRange.end)
-      offsets = {
-        ...wordRange,
-        text: editorText.slice(wordRange.start, wordRange.end),
-      }
-    }
-
-    if (offsets.start === offsets.end || !offsets.text.trim()) {
-      setContextMenu(null)
-      return
-    }
-
-    rememberActionSelection({ field, ...offsets })
+    setContextMenu(null)
     setMarkerMenu(null)
     setMarkerContextMenu(null)
-    setActiveVariant(null)
   }
 
   const createVariantFromSelection = () => {
@@ -10859,6 +11052,74 @@ function App() {
     closeStartCreateDialog()
   }
 
+  const cancelBoundaryPairBreak = () => {
+    setPendingBoundaryPairBreak(null)
+  }
+
+  const confirmBoundaryPairBreak = () => {
+    const action = pendingBoundaryPairBreak
+
+    if (!action) {
+      return
+    }
+
+    setPendingBoundaryPairBreak(null)
+    applySemanticBlockContentChange(
+      action.field,
+      action.nextContent,
+      action.nextCursorOffset,
+      { unlinkPairIds: action.pairIds },
+    )
+  }
+
+  const renderBoundaryPairBreakDialog = () =>
+    pendingBoundaryPairBreak ? (
+      <div className="modal-backdrop" onMouseDown={cancelBoundaryPairBreak}>
+        <section
+          aria-labelledby="boundary-break-title"
+          aria-modal="true"
+          className="modal-panel boundary-break-modal"
+          onMouseDown={(event) => event.stopPropagation()}
+          role="dialog"
+        >
+          <div className="modal-header">
+            <h2 id="boundary-break-title">Удалить связи?</h2>
+            <button
+              aria-label="Закрыть"
+              className="modal-close-button"
+              onClick={cancelBoundaryPairBreak}
+              type="button"
+            >
+              x
+            </button>
+          </div>
+          <p className="modal-warning-text">
+            {pendingBoundaryPairBreak.pairLabels.length === 1
+              ? 'Связь следующей находки будет разрушена:'
+              : 'Связи следующих находок будут разрушены:'}
+          </p>
+          <ol className="boundary-break-list">
+            {pendingBoundaryPairBreak.pairLabels.map((label, index) => (
+              <li key={`${label}:${index}`}>{label}</li>
+            ))}
+          </ol>
+          <div className="modal-actions">
+            <button onClick={cancelBoundaryPairBreak} type="button">
+              Отмена
+            </button>
+            <button
+              autoFocus
+              className="danger-action-button"
+              onClick={confirmBoundaryPairBreak}
+              type="button"
+            >
+              Удалить связи
+            </button>
+          </div>
+        </section>
+      </div>
+    ) : null
+
   const handleDescriptionClick = useEvent((event: MouseEvent<HTMLDivElement>) =>
     handleEditorClick('description', event),
   )
@@ -11373,7 +11634,14 @@ function App() {
               <span className="search-browser-text">
                 <strong>{item.finding.name}</strong>
                 {item.finding.description && (
-                  <span>{item.finding.description}</span>
+                  <span className="search-browser-detail">
+                    {item.finding.description}
+                  </span>
+                )}
+                {item.finding.conclusion && (
+                  <span className="search-browser-detail search-browser-conclusion">
+                    {item.finding.conclusion}
+                  </span>
                 )}
               </span>
             </button>
@@ -12376,6 +12644,7 @@ function App() {
                           markerOptionValueRefs.current.delete(key)
                         }
                       }}
+                      lang="ru-RU"
                       role="textbox"
                       spellCheck
                       suppressContentEditableWarning
@@ -12784,6 +13053,7 @@ function App() {
                           onMouseUp={updateStartTemplateActiveMarker}
                           onPaste={handleEditorPaste}
                           ref={startTemplateDescriptionRef}
+                          lang="ru-RU"
                           role="textbox"
                           spellCheck
                           suppressContentEditableWarning
@@ -12852,6 +13122,7 @@ function App() {
         {renderUserSwitchConfirmDialog()}
         {renderProtocolSessionCloseDialog()}
         {renderProtocolDownloadSaveDialog()}
+        {renderBoundaryPairBreakDialog()}
       </main>
     )
   }
@@ -13523,6 +13794,7 @@ function App() {
       )}
 
       {renderMarkerSettingsDialog()}
+      {renderBoundaryPairBreakDialog()}
 
       {isTemplatesDialogOpen && (
         <ProtocolTemplatesDialog

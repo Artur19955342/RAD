@@ -27,6 +27,7 @@ const EditableArea = memo(
         data-placeholder={placeholder}
         dangerouslySetInnerHTML={{ __html: html }}
         id={id}
+        lang="ru-RU"
         onClick={onClick}
         onContextMenu={onContextMenu}
         onInput={onInput}
