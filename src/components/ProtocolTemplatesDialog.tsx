@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import type { ProtocolTemplate } from '../types'
 
 type ProtocolTemplatesDialogProps = {
@@ -29,11 +29,27 @@ function ProtocolTemplatesDialog({
   const [draftName, setDraftName] = useState(
     initialMode === 'save' ? currentTemplateName : '',
   )
+  const [searchQuery, setSearchQuery] = useState('')
   const selectedTemplate =
     templates.find((template) => template.id === selectedTemplateId) ?? null
   const deleteTemplate =
     templates.find((template) => template.id === deleteTemplateId) ?? null
   const isSaveMode = initialMode === 'save'
+  const visibleTemplates = useMemo(() => {
+    const query = searchQuery.trim().toLocaleLowerCase('ru-RU')
+
+    return [...templates]
+      .filter((template) =>
+        query
+          ? template.name.toLocaleLowerCase('ru-RU').includes(query)
+          : true,
+      )
+      .sort((first, second) =>
+        first.name.localeCompare(second.name, 'ru-RU', {
+          sensitivity: 'base',
+        }),
+      )
+  }, [searchQuery, templates])
 
   const chooseSelectedTemplate = () => {
     if (!selectedTemplate) {
@@ -139,14 +155,24 @@ function ProtocolTemplatesDialog({
             </div>
           </div>
         ) : templates.length > 0 ? (
-          <div className="template-dialog-grid">
-            {templates.map((template) => {
+          <>
+            <input
+              aria-label="Поиск шаблонов"
+              className="template-dialog-search"
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="Поиск шаблонов"
+              type="search"
+              value={searchQuery}
+            />
+            {visibleTemplates.length > 0 ? (
+              <div className="template-dialog-list">
+                {visibleTemplates.map((template) => {
               const isSelected = template.id === selectedTemplateId
 
               return (
                 <div
                   className={[
-                    'template-dialog-item',
+                    'template-dialog-row',
                     isSelected ? 'is-selected' : '',
                   ]
                     .filter(Boolean)
@@ -155,13 +181,22 @@ function ProtocolTemplatesDialog({
                 >
                   <button
                     className="template-dialog-template-button"
+                    onDoubleClick={() => {
+                      onSelectTemplate(template)
+                      onClose()
+                    }}
                     onClick={() => {
                       setSelectedTemplateId(template.id)
                     }}
                     title={template.name}
                     type="button"
                   >
-                    <span>{template.name}</span>
+                    <span className="template-dialog-template-name">
+                      {template.name}
+                    </span>
+                    <span className="template-dialog-template-meta">
+                      {new Date(template.updatedAt).toLocaleDateString('ru-RU')}
+                    </span>
                   </button>
                   <button
                     aria-label={`Удалить шаблон ${template.name}`}
@@ -175,8 +210,12 @@ function ProtocolTemplatesDialog({
                   </button>
                 </div>
               )
-            })}
-          </div>
+                })}
+              </div>
+            ) : (
+              <p className="template-dialog-empty">Ничего не найдено</p>
+            )}
+          </>
         ) : (
           <p className="template-dialog-empty">Шаблонов пока нет</p>
         )}

@@ -136,6 +136,8 @@ const sanitizeStoredEditorSegment = (
           ? value.defaultOptionIndex
           : null,
       id: sanitizeSegmentId(value.id),
+      mainBlockValue:
+        typeof value.mainBlockValue === 'string' ? value.mainBlockValue : '',
       options,
       selectedOptionIndex:
         typeof value.selectedOptionIndex === 'number' &&

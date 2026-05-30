@@ -253,6 +253,15 @@
   overflow: auto;
 }
 
+.start-template-editor .semantic-block-brace {
+  display: inline-block;
+  width: 0;
+  overflow: hidden;
+  color: transparent;
+  opacity: 0;
+  pointer-events: none;
+}
+
 .start-marker-field textarea {
   min-height: 110px;
   resize: vertical;
@@ -919,6 +928,12 @@
   opacity: 0.42;
 }
 
+.section-main-block-boundary .semantic-block-brace {
+  color: #3f7fb8;
+  opacity: 0.68;
+  font-weight: 600;
+}
+
 .variant-token {
   display: inline;
   padding: 1px 2px 2px;
@@ -1036,10 +1051,10 @@
   grid-column: 3;
   min-width: 0;
   min-height: 0;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
   overflow-x: hidden;
-  overflow-y: auto;
+  overflow-y: hidden;
   scrollbar-gutter: stable;
   border-left: 1px solid var(--line);
   background: var(--panel);
@@ -1235,6 +1250,7 @@ button:focus-visible {
 }
 
 .passport-panel {
+  min-height: 0;
   display: grid;
   gap: 8px;
   padding: 12px 14px;
@@ -1384,16 +1400,20 @@ button:focus-visible {
   width: min(1120px, 100%);
 }
 
-.template-dialog-grid {
+.template-dialog-search {
+  width: 100%;
+  margin-bottom: 10px;
+}
+
+.template-dialog-list {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 10px;
+  gap: 6px;
   max-height: min(520px, 62vh);
   overflow: auto;
   padding-right: 2px;
 }
 
-.template-dialog-item {
+.template-dialog-row {
   min-width: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 34px;
@@ -1406,15 +1426,19 @@ button:focus-visible {
   text-align: left;
 }
 
-.template-dialog-item.is-selected {
+.template-dialog-row.is-selected {
   border-color: var(--focus);
   box-shadow: 0 0 0 3px var(--focus-soft);
 }
 
 .template-dialog-template-button {
   min-width: 0;
-  min-height: 42px;
-  padding: 0 10px;
+  min-height: 38px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 0 12px;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -1425,7 +1449,7 @@ button:focus-visible {
   background: var(--row-hover);
 }
 
-.template-dialog-template-button span {
+.template-dialog-template-name {
   display: block;
   max-width: 100%;
   overflow: hidden;
@@ -1437,9 +1461,16 @@ button:focus-visible {
   white-space: nowrap;
 }
 
+.template-dialog-template-meta {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
 .template-dialog-delete-button {
   width: 34px;
-  min-height: 42px;
+  min-height: 38px;
   padding: 0;
   border-width: 0 0 0 1px;
   border-color: var(--button-line);
@@ -1519,7 +1550,6 @@ button:focus-visible {
 }
 
 .findings-panel {
-  flex: 1 1 auto;
   min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -1537,8 +1567,8 @@ button:focus-visible {
 
 .finding-summary-list {
   min-height: 0;
-  display: grid;
-  align-content: start;
+  display: flex;
+  flex-direction: column;
   gap: 4px;
   overflow-x: hidden;
   overflow-y: auto;
@@ -1548,6 +1578,8 @@ button:focus-visible {
 }
 
 .finding-summary-item {
+  flex: 0 0 auto;
+  min-height: 44px;
   min-width: 0;
   width: 100%;
   display: grid;
@@ -3103,7 +3135,9 @@ button:focus-visible {
 }
 
 .finding-browser-tree {
-  display: grid;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
   max-height: min(520px, 62vh);
   overflow: auto;
@@ -3111,12 +3145,16 @@ button:focus-visible {
 }
 
 .browser-folder {
-  display: grid;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
 }
 
 .browser-folder-row {
+  flex: 0 0 auto;
   min-width: 0;
+  min-height: 48px;
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr) 38px;
   gap: 8px;
@@ -3158,8 +3196,11 @@ button:focus-visible {
 }
 
 .browser-finding-item {
-  min-height: 0;
+  flex: 0 0 auto;
+  min-height: 58px;
   display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: start;
   justify-items: stretch;
   gap: 6px;
   padding: 10px;
@@ -3172,18 +3213,40 @@ button:focus-visible {
   background: var(--row-hover);
 }
 
-.browser-finding-item strong {
+.browser-finding-content {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.browser-finding-content strong {
   color: var(--text-strong);
   font-size: 14px;
   line-height: 1.25;
 }
 
-.browser-finding-item span {
+.browser-finding-content span {
   color: var(--text);
   font-size: 13px;
   line-height: 1.4;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+}
+
+.browser-finding-delete {
+  width: 26px;
+  min-height: 26px;
+  padding: 0;
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.browser-finding-delete:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: #fee2e2;
 }
 
 .browser-finding-conclusion {
@@ -3665,15 +3728,12 @@ button:focus-visible {
   .side-panel {
     grid-column: 1;
     grid-row: 2;
-    overflow: visible;
+    overflow: hidden;
     scrollbar-gutter: auto;
     border-left: 0;
     border-top: 1px solid var(--line);
   }
 
-  .template-dialog-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 
 @media (max-width: 560px) {
@@ -3730,9 +3790,18 @@ button:focus-visible {
   }
 
   .template-dialog-save-actions,
-  .template-dialog-grid,
   .protocol-export-settings-grid {
     grid-template-columns: 1fr;
+  }
+
+  .template-dialog-template-button {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+    padding: 7px 10px;
+  }
+
+  .template-dialog-template-meta {
+    font-size: 11px;
   }
 
   .protocol-general-settings,

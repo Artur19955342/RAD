@@ -16,6 +16,7 @@ import {
 import {
   getMarkerOptionVariantOptionsSignature,
   getMarkerTemplateParts,
+  hasMarkerOptionVariantChange,
 } from '../utils/markerOptions'
 
 type ProtocolDownloadSaveItemBase = {
@@ -453,7 +454,16 @@ const ProtocolDownloadSaveDialogPanel = ({
     }
 
     if (item.kind === 'section-option') {
-      return item.isFindingReferenceOnly ? 'Находки' : 'Вариант'
+      const hasFindingChange =
+        item.previousFindingIds.join('\n') !== item.option.findingIds.join('\n')
+
+      if (item.isFindingReferenceOnly || hasFindingChange) {
+        return 'Находки'
+      }
+
+      return hasMarkerOptionVariantChange(item.value, item.previousValue)
+        ? 'Вариант'
+        : 'Текст'
     }
 
     if (item.kind === 'section-structure') {

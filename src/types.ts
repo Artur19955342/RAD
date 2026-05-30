@@ -35,6 +35,7 @@ export type MarkerOption = {
 export type MarkerSegment = {
   defaultOptionIndex: number | null
   id: number
+  mainBlockValue: string
   type: 'marker'
   title: string
   options: MarkerOption[]
